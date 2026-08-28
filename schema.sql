@@ -1,5 +1,7 @@
 -- Market intelligence pipeline — full Supabase schema.
--- Safe to run more than once. Run in the Supabase SQL editor.
+-- Idempotent: safe to run repeatedly. Run in the Supabase SQL editor.
+-- The `alter ... add column if not exists` lines below bring pre-existing
+-- tables (created by an earlier version) up to the current shape.
 
 -- ── company_queue ─────────────────────────────────────────────────────────
 create table if not exists company_queue (
@@ -9,6 +11,10 @@ create table if not exists company_queue (
     domain        text not null,
     last_scanned  timestamptz not null default '1970-01-01T00:00:00Z'
 );
+alter table company_queue add column if not exists company_name text;
+alter table company_queue add column if not exists domain       text;
+alter table company_queue add column if not exists last_scanned timestamptz
+    not null default '1970-01-01T00:00:00Z';
 
 -- ── signals ───────────────────────────────────────────────────────────────
 create table if not exists signals (
@@ -21,6 +27,13 @@ create table if not exists signals (
     url               text,
     created_at        timestamptz not null default now()
 );
+alter table signals add column if not exists company          text;
+alter table signals add column if not exists domain           text;
+alter table signals add column if not exists conviction_score int;
+alter table signals add column if not exists headline         text;
+alter table signals add column if not exists analysis         text;
+alter table signals add column if not exists url              text;
+alter table signals add column if not exists created_at       timestamptz not null default now();
 
 -- Collapse any pre-existing duplicates, keeping the newest row per story ...
 delete from signals s
@@ -45,8 +58,13 @@ create table if not exists scan_logs (
     signals_found     int  not null default 0,
     scanned_at        timestamptz not null default now()
 );
--- Backfill for tables created before raw_collected existed.
-alter table scan_logs add column if not exists raw_collected int not null default 0;
+alter table scan_logs add column if not exists company_symbol  text;
+alter table scan_logs add column if not exists company_name    text;
+alter table scan_logs add column if not exists domain          text;
+alter table scan_logs add column if not exists raw_collected   int not null default 0;
+alter table scan_logs add column if not exists raw_items_count int not null default 0;
+alter table scan_logs add column if not exists signals_found   int not null default 0;
+alter table scan_logs add column if not exists scanned_at      timestamptz not null default now();
 create index if not exists scan_logs_scanned_at_idx
     on scan_logs (scanned_at desc);
 
@@ -57,5 +75,12 @@ create table if not exists seen_urls (
     company_symbol  text,
     first_seen_at   timestamptz not null default now()
 );
+alter table seen_urls add column if not exists url            text;
+alter table seen_urls add column if not exists company_symbol text;
+alter table seen_urls add column if not exists first_seen_at  timestamptz not null default now();
 create index if not exists seen_urls_first_seen_at_idx
     on seen_urls (first_seen_at desc);
+
+-- Force PostgREST to refresh its schema cache so the API sees new columns
+-- immediately (otherwise a PGRST204 "column not found" can linger ~seconds).
+notify pgrst, 'reload schema';

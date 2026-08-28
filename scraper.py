@@ -51,9 +51,14 @@ def _is_us_ticker(ticker: str) -> bool:
     return ticker.isalpha()
 
 
-def fetch_sec_filings(ticker: str, max_items: int = 6) -> list[dict[str, Any]]:
+def fetch_sec_filings(ticker: str, per_form: int = 2) -> list[dict[str, Any]]:
     """
-    Fetch recent 10-K / 10-Q / 8-K filings for a ticker from EDGAR's Atom feed.
+    Fetch the most recent 10-K / 10-Q / 8-K filings for a ticker from EDGAR's
+    Atom feed (``per_form`` most recent of each form type).
+
+    The Atom feed carries only filing metadata, so these items are weak signal
+    on their own — kept as context and deliberately ranked below news in
+    gather_raw_items().
 
     Returns a list of {title, summary, url, source} dicts.
     """
@@ -76,13 +81,17 @@ def fetch_sec_filings(ticker: str, max_items: int = 6) -> list[dict[str, Any]]:
             continue
 
         feed = feedparser.parse(resp.content)
-        for entry in feed.entries[:max_items]:
+        for entry in feed.entries[:per_form]:
             title = entry.get("title", f"{form} filing")
             link = entry.get("link", "")
-            summary = _clean(entry.get("summary") or entry.get("title"))
+            filed = entry.get("updated", "") or entry.get("published", "")
+            summary = _clean(
+                f"{entry.get('summary') or title}. Filed {filed}." if filed
+                else (entry.get("summary") or title)
+            )
             items.append(
                 {
-                    "title": f"SEC {form}: {title}",
+                    "title": f"SEC {form} filing — {title}",
                     "summary": summary,
                     "url": link,
                     "source": "SEC EDGAR",
@@ -148,9 +157,11 @@ def gather_raw_items(
     Returns a ScrapeResult(items, collected) where ``collected`` is the unique
     item count before the seen-URL filter — recorded for quota-savings auditing.
     """
+    # News first: it carries the real CapEx / supply-chain signal and should
+    # win the per-company grading budget ahead of thin SEC filing metadata.
     items: list[dict[str, Any]] = []
-    items.extend(fetch_sec_filings(ticker))
     items.extend(fetch_google_news(company_name))
+    items.extend(fetch_sec_filings(ticker))
 
     # De-duplicate on URL within this batch while preserving order.
     seen: set[str] = set()

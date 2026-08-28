@@ -154,14 +154,18 @@ def scan() -> int:
             )
 
             if verdict["valid"]:
-                written = save_signal(
-                    company=name,
-                    domain=domain,
-                    score=score,
-                    headline=verdict["headline"],
-                    analysis=verdict["analysis"],
-                    url=url,
-                )
+                try:
+                    written = save_signal(
+                        company=name,
+                        domain=domain,
+                        score=score,
+                        headline=verdict["headline"],
+                        analysis=verdict["analysis"],
+                        url=url,
+                    )
+                except Exception as exc:  # a DB write must not kill the scan
+                    written = False
+                    print(f"      ! save_signal failed: {exc}")
                 if written:
                     company_signals += 1
                     total_signals += 1
