@@ -2,13 +2,15 @@
 Zero-cost data acquisition with full article / filing text.
 
 Sources (no API keys):
-  * Google News RSS  -> recent headlines; redirect URLs are resolved to the
-                        real publisher link, then the article body is extracted
-  * SEC EDGAR        -> recent 8-K / 10-K / 10-Q primary-document text
-                        (data.sec.gov submissions JSON)
+  * SEC EDGAR   -> material 8-K items (1.01/1.03/2.01/7.01/8.01) + 6-K / 20-F,
+                   primary-document text via data.sec.gov submissions JSON
+  * Google News -> recent headlines; redirect URLs are resolved to the real
+                   publisher link BEFORE de-duplication, then the body is
+                   extracted
 
-Bodies are extracted with trafilatura so the analyzer grades real content,
-not just a headline.
+Bodies are extracted with trafilatura. Google-redirect resolution happens
+before filter_unseen_items() so the dedup hash is always the canonical
+publisher URL.
 """
 
 from __future__ import annotations
@@ -27,8 +29,9 @@ import trafilatura
 class ScrapeResult(NamedTuple):
     """Outcome of scraping one company."""
 
-    items: list[dict[str, Any]]  # items to grade (post seen-URL filter)
-    collected: int               # unique items found before the seen-URL filter
+    items: list[dict[str, Any]]   # items to grade (post seen-URL filter, with text)
+    collected: int                # unique items found before the seen-URL filter
+    drops: dict[str, int]         # drop reasons: unresolved_google/paywall_teaser/short_body
 
 
 BROWSER_UA = (
@@ -36,7 +39,6 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 BROWSER_HEADERS = {"User-Agent": BROWSER_UA}
-# SEC requires a descriptive User-Agent with contact info on every request.
 SEC_HEADERS = {
     "User-Agent": "ResearchBot admin@investor.com",
     "Accept-Encoding": "gzip, deflate",
@@ -45,9 +47,28 @@ SEC_HEADERS = {
 REQUEST_TIMEOUT = 20
 ARTICLE_TIMEOUT = 15
 ARTICLE_TEXT_CHARS = 3500
-MIN_BODY_CHARS = 220
+MAX_DOWNLOAD_BYTES = 1_500_000    # abort heavy pages to cap memory
+MIN_BODY = 400                    # chars; below this the body is unusable
 
-TARGET_FORMS = ("8-K", "10-K", "10-Q")
+# Hard paywall / bot-wall markers -> always reject.
+_PAYWALL_HARD = (
+    "subscribe to read", "subscribe to continue", "metered",
+    "cf-browser-verification", "cf_browser_verification",
+    "please enable javascript", "create a free account to",
+    "this content is for subscribers",
+)
+# Soft marker -> reject only when the body is also short (real articles use it too).
+_PAYWALL_SOFT = ("continue reading",)
+
+# 8-K items worth reading (material agreements / bankruptcy / asset sales /
+# Reg FD disclosure / other material events).
+_MATERIAL_8K_ITEMS = {"1.01", "1.03", "2.01", "7.01", "8.01"}
+_TARGET_FORMS = {"8-K", "8-K/A", "6-K", "6-K/A", "20-F", "20-F/A"}
+_SEC_BOILERPLATE_HEAD = re.compile(
+    r"^\s*(united states\s+securities and exchange commission|"
+    r"table of contents|form\s+(10-k|10-q))", re.I,
+)
+
 _CIK_MAP: dict[str, str] | None = None
 
 
@@ -60,41 +81,83 @@ def _clean(text: str | None, limit: int = ARTICLE_TEXT_CHARS) -> str:
 
 
 def _is_us_ticker(ticker: str) -> bool:
-    """EDGAR only covers US-listed issuers; skip foreign tickers like 6954.T."""
     return "." not in ticker and ticker.isalpha()
 
 
-def extract_article_text(url: str, headers: dict[str, str] | None = None) -> str:
-    """Fetch a URL and return its main body text ('' on any failure)."""
+def _is_google_news(url: str) -> bool:
+    return "news.google.com" in urlparse(url or "").netloc
+
+
+def _download(url: str, headers: dict[str, str] | None = None) -> tuple[str, str]:
+    """
+    Stream a URL. Returns (html, reason). reason is "" on success or one of
+    "too_large" / "http_error" / "network".
+    """
     try:
-        resp = requests.get(
-            url, headers=headers or BROWSER_HEADERS, timeout=ARTICLE_TIMEOUT
-        )
-        resp.raise_for_status()
-        text = trafilatura.extract(
-            resp.text,
-            include_comments=False,
-            include_tables=False,
-            favor_precision=True,
-        )
-        return _clean(text)
-    except Exception:
-        return ""
+        with requests.get(
+            url, headers=headers or BROWSER_HEADERS, timeout=ARTICLE_TIMEOUT,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            total = 0
+            chunks: list[bytes] = []
+            for chunk in resp.iter_content(65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    return "", "too_large"
+                chunks.append(chunk)
+            enc = resp.encoding or "utf-8"
+            return b"".join(chunks).decode(enc, errors="replace"), ""
+    except requests.HTTPError:
+        return "", "http_error"
+    except requests.RequestException:
+        return "", "network"
+
+
+def _looks_paywalled(text: str) -> bool:
+    low = text.lower()
+    if any(m in low for m in _PAYWALL_HARD):
+        return True
+    if len(text) < 900 and any(m in low for m in _PAYWALL_SOFT):
+        return True
+    return False
+
+
+def extract_article_text(
+    url: str, headers: dict[str, str] | None = None
+) -> tuple[str, str]:
+    """
+    Fetch a URL and return (body_text, reason).
+
+    reason is "" on success, else "short_body" / "paywall_teaser" /
+    "too_large" / "http_error" / "network" / "sec_boilerplate".
+    """
+    html, dl_reason = _download(url, headers)
+    if dl_reason:
+        return "", dl_reason
+    text = trafilatura.extract(
+        html, include_comments=False, include_tables=False, favor_precision=True
+    )
+    body = _clean(text)
+    if len(body) < MIN_BODY:
+        return "", "short_body"
+    if _looks_paywalled(body):
+        return "", "paywall_teaser"
+    if _SEC_BOILERPLATE_HEAD.match(body) and len(body) < 1200:
+        return "", "sec_boilerplate"
+    return body, ""
 
 
 # ------------------------------------------------------------------------ news
 
 def _resolve_google_news_url(google_url: str) -> str:
     """
-    Resolve a news.google.com/rss/articles/<id> URL to the real publisher URL.
-
-    Google stopped embedding the target in the id; it now comes from an
-    internal RPC that needs a signature + timestamp scraped from the article
-    page. Returns the original URL unchanged if resolution fails.
+    Resolve a news.google.com/rss/articles/<id> URL to the publisher URL via
+    Google's internal RPC. Returns the original URL unchanged on failure.
     """
-    if "news.google.com" not in urlparse(google_url).netloc:
-        return google_url
-    if "/articles/" not in google_url:
+    if not _is_google_news(google_url) or "/articles/" not in google_url:
         return google_url
     try:
         art_id = google_url.split("/articles/")[1].split("?")[0]
@@ -131,7 +194,6 @@ def _resolve_google_news_url(google_url: str) -> str:
 
 
 def fetch_google_news(company_name: str, max_items: int = 18) -> list[dict[str, Any]]:
-    """Recent Google News RSS results tuned to infrastructure / supply chain."""
     query = (
         f'{company_name} (capex OR "capital expenditure" OR "supply chain" OR '
         f'expansion OR factory OR plant OR "data center" OR reactor OR mine OR '
@@ -157,9 +219,10 @@ def fetch_google_news(company_name: str, max_items: int = 18) -> list[dict[str, 
         items.append(
             {
                 "title": entry.get("title", ""),
-                "summary": "",              # filled by _enrich
+                "summary": "",
                 "url": entry.get("link", ""),
                 "source": f"News{f' / {src}' if src else ''}",
+                "origin": "news",
             }
         )
     return items
@@ -184,14 +247,20 @@ def _cik_map() -> dict[str, str]:
     return _CIK_MAP
 
 
-def fetch_sec_filings(ticker: str, max_filings: int = 3) -> list[dict[str, Any]]:
-    """
-    Recent 8-K / 10-K / 10-Q filings for a US ticker, with primary-document text.
-    """
-    if not _is_us_ticker(ticker):
-        print(f"[scraper] {ticker}: non-US ticker, skipping EDGAR.")
-        return []
+def _material_8k(form: str, items_field: str) -> bool:
+    if form.startswith("6-K") or form.startswith("20-F"):
+        return True
+    if not form.startswith("8-K"):
+        return False
+    present = {p.strip() for p in (items_field or "").replace(";", ",").split(",")}
+    return bool(present & _MATERIAL_8K_ITEMS)
 
+
+def fetch_sec_filings(ticker: str, max_filings: int = 3) -> list[dict[str, Any]]:
+    """Recent material 8-K / 6-K / 20-F filings with primary-document text."""
+    if not _is_us_ticker(ticker):
+        # 6-K / 20-F issuers can still be non-alpha; try the map anyway.
+        pass
     cik = _cik_map().get(ticker.upper())
     if not cik:
         print(f"[scraper] {ticker}: no CIK on file, skipping EDGAR.")
@@ -212,81 +281,78 @@ def fetch_sec_filings(ticker: str, max_filings: int = 3) -> list[dict[str, Any]]
     accnos = recent.get("accessionNumber", [])
     docs = recent.get("primaryDocument", [])
     dates = recent.get("filingDate", [])
+    items_col = recent.get("items", [""] * len(forms))
 
-    items: list[dict[str, Any]] = []
-    for form, accno, doc, date in zip(forms, accnos, docs, dates):
-        if form not in TARGET_FORMS or not doc:
+    out: list[dict[str, Any]] = []
+    for form, accno, doc, date, itms in zip(forms, accnos, docs, dates, items_col):
+        if form not in _TARGET_FORMS or not doc:
+            continue
+        if not _material_8k(form, itms):
             continue
         doc_url = (
             f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
             f"{accno.replace('-', '')}/{doc}"
         )
-        text = extract_article_text(doc_url, headers=SEC_HEADERS)
+        text, reason = extract_article_text(doc_url, headers=SEC_HEADERS)
         time.sleep(0.3)  # SEC fair-access
-        if len(text) < MIN_BODY_CHARS:
+        if reason:
             continue
-        items.append(
+        label = f"SEC {form} ({itms})" if itms else f"SEC {form}"
+        out.append(
             {
-                "title": f"SEC {form} filed {date} — {ticker.upper()}",
+                "title": f"{label} filed {date} — {ticker.upper()}",
                 "summary": text,
                 "url": doc_url,
                 "source": "SEC EDGAR",
+                "origin": "sec",
             }
         )
-        if len(items) >= max_filings:
+        if len(out) >= max_filings:
             break
-    return items
+    return out
 
 
 # --------------------------------------------------------------------- gather
 
-def _enrich(items: list[dict[str, Any]], limit: int) -> None:
-    """Resolve redirect URLs and fill empty summaries with article text."""
-    enriched = 0
-    for item in items[:limit]:
-        if item.get("summary"):
-            continue
-        url = item.get("url", "")
-        if not url:
-            continue
-        resolved = _resolve_google_news_url(url)
-        if resolved != url:
-            item["url"] = resolved
-            url = resolved
-        if "news.google.com" in urlparse(url).netloc:
-            continue  # still unresolved -> no article body available
-        text = extract_article_text(url)
-        if text:
-            item["summary"] = text
-            enriched += 1
-        time.sleep(0.2)
-    if enriched:
-        print(f"[scraper]   extracted full text for {enriched} article(s).")
-
-
 def gather_raw_items(
-    ticker: str, company_name: str, skip_seen: bool = True, enrich_limit: int = 12
+    ticker: str,
+    company_name: str,
+    skip_seen: bool = True,
+    budget: int = 6,
 ) -> ScrapeResult:
     """
-    Aggregate news + SEC items for one company, with body text extracted.
+    Aggregate SEC + news for one company, bodies extracted.
 
-    Returns ScrapeResult(items, collected); ``collected`` is the unique item
-    count before the seen-URL filter (recorded for quota-savings auditing).
+    Order: up to 3 material SEC filings first, then resolved news fills the
+    remaining budget. Google redirects are resolved BEFORE the seen-URL filter
+    so dedup hashes the canonical publisher URL.
     """
-    # News first: it carries the timely CapEx / supply-chain signal.
-    items: list[dict[str, Any]] = []
-    items.extend(fetch_google_news(company_name))
-    items.extend(fetch_sec_filings(ticker))
+    drops = {"unresolved_google": 0, "paywall_teaser": 0, "short_body": 0}
 
-    # De-duplicate on URL within this batch while preserving order.
-    seen: set[str] = set()
+    sec_items = fetch_sec_filings(ticker, max_filings=3)  # already have text
+    news_items = fetch_google_news(company_name)
+
+    # Resolve Google-redirect URLs up front (before dedup / seen filter).
+    for it in news_items:
+        if _is_google_news(it["url"]):
+            resolved = _resolve_google_news_url(it["url"])
+            if _is_google_news(resolved):
+                it["_unresolved"] = True
+            else:
+                it["url"] = resolved
+            time.sleep(0.15)
+
+    ordered = sec_items + news_items
+
+    # In-batch dedup on the (now canonical) URL.
+    seen_local: set[str] = set()
     deduped: list[dict[str, Any]] = []
-    for item in items:
-        key = item.get("url") or item.get("title", "")
-        if key in seen:
+    for it in ordered:
+        key = it.get("url") or it.get("title", "")
+        if key in seen_local:
             continue
-        seen.add(key)
-        deduped.append(item)
+        seen_local.add(key)
+        deduped.append(it)
 
     collected = len(deduped)
 
@@ -295,23 +361,40 @@ def gather_raw_items(
             from db import filter_unseen_items
 
             deduped = filter_unseen_items(deduped)
-        except Exception as exc:  # ImportError, missing creds, network, ...
+        except Exception as exc:
             print(f"[scraper] seen-URL filter unavailable ({exc}); grading all.")
 
-    # Fetch bodies only for the items we'll actually grade.
-    _enrich(deduped, enrich_limit)
+    # Build the graded set: SEC (already has text) + news bodies up to budget.
+    usable: list[dict[str, Any]] = []
+    extracted = 0
+    for it in deduped:
+        if len(usable) >= budget:
+            break
+        if it.get("origin") == "sec" and it.get("summary"):
+            usable.append(it)
+            continue
+        if it.get("_unresolved") or _is_google_news(it.get("url", "")):
+            drops["unresolved_google"] += 1
+            continue
+        body, reason = extract_article_text(it["url"])
+        time.sleep(0.2)
+        if reason == "paywall_teaser":
+            drops["paywall_teaser"] += 1
+            continue
+        if reason in ("short_body", "sec_boilerplate", "too_large", "http_error", "network"):
+            drops["short_body"] += 1
+            continue
+        it["summary"] = body
+        extracted += 1
+        usable.append(it)
 
-    # Drop items with no usable body (dead links, paywalls, unresolved redirects).
-    usable = [
-        it for it in deduped
-        if len((it.get("summary") or "").strip()) >= 60
-    ]
-    dropped = len(deduped) - len(usable)
-
+    if extracted:
+        print(f"[scraper]   extracted full text for {extracted} article(s).")
+    drop_str = ", ".join(f"{k}={v}" for k, v in drops.items() if v)
     print(
         f"[scraper] {company_name} ({ticker}): {collected} collected, "
-        f"{len(usable)} new with text"
-        + (f" ({dropped} dropped: no body)" if dropped else "")
+        f"{len(usable)} to grade"
+        + (f" (dropped: {drop_str})" if drop_str else "")
         + "."
     )
-    return ScrapeResult(items=usable, collected=collected)
+    return ScrapeResult(items=usable, collected=collected, drops=drops)

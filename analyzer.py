@@ -1,5 +1,5 @@
 """
-LLM-powered conviction grading.
+LLM-powered supply-side conviction grading.
 
 Talks to any OpenAI-compatible chat-completions endpoint. Defaults to Groq's
 free API (https://console.groq.com/keys) — no billing, no credit card required.
@@ -14,10 +14,10 @@ Configure via the local .env:
 qwen3.8-27b with reasoning disabled is ~600 tokens/call and fits Groq's free
 8k TPM budget. groq/compound-mini has a 70k TPM budget if you need headroom.
 
-Other zero-cost backends that work by changing only those vars:
-    OpenRouter free tier -> https://openrouter.ai/api/v1   + a ":free" model id
-    Cerebras             -> https://api.cerebras.ai/v1
-    Local Ollama         -> http://localhost:11434/v1   (set LLM_REASONING_EFFORT=off)
+The model returns a strict JSON schema (auditable evidence quotes + an
+earnings bridge); Python then *code-gates* the verdict — the LLM cannot make
+an item "valid" unless it is the primary issuer, the catalyst is quantified,
+and it supplied >= 2 verbatim evidence quotes for a real supply-side catalyst.
 """
 
 from __future__ import annotations
@@ -48,10 +48,6 @@ if not LLM_API_KEY:
 LLM_BASE_URL = (_clean(os.environ.get("LLM_BASE_URL")) or "https://api.groq.com/openai/v1").rstrip("/")
 LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "qwen/qwen3.8-27b"
 
-# Reasoning models otherwise emit thousands of hidden tokens per call and blow
-# small free-tier per-minute token budgets. "none" disables it (qwen3); use
-# "low" for gpt-oss. Any non-empty value is sent as-is; "off" omits the field
-# for backends that reject it.
 _re_env = _clean(os.environ.get("LLM_REASONING_EFFORT")) or "none"
 LLM_REASONING_EFFORT = "" if _re_env.lower() == "off" else _re_env
 
@@ -60,6 +56,14 @@ _TIMEOUT = 60
 _MAX_RETRY_AFTER = 30  # seconds; longer waits are treated as daily exhaustion
 _MAX_ATTEMPTS = 4
 _SNIPPET_CHARS = 2600
+
+_MAX_ABS_DELTA_PCT = 25.0
+_CATALYST_TYPES = [
+    "committed_capex", "ppa", "offtake", "capacity_addition",
+    "bottleneck", "lead_time", "plan_or_rumor", "not_supply_side",
+]
+_DISQUALIFYING_CATALYSTS = {"plan_or_rumor", "not_supply_side"}
+_RECOMMENDATIONS = {"HIGH CONVICTION BUY", "BUY", "NEUTRAL / WATCH", "AVOID"}
 
 
 class LLMQuotaError(RuntimeError):
@@ -70,85 +74,108 @@ class _AuthError(RuntimeError):
     """Internal: 401/403 from the LLM API."""
 
 
+# --------------------------------------------------------------- strict schema
+
+_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "conviction_score", "is_primary_issuer", "catalyst_type",
+        "evidence_quotes", "quantified", "cited_capex_usd_m", "cited_capacity",
+        "earnings_bridge", "price_target_delta_pct", "recommendation",
+        "headline", "supply_chain_driver", "analysis", "financial_impact_thesis",
+    ],
+    "properties": {
+        "conviction_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "is_primary_issuer": {"type": "boolean"},
+        "catalyst_type": {"type": "string", "enum": _CATALYST_TYPES},
+        "evidence_quotes": {
+            "type": "array", "minItems": 1, "maxItems": 3,
+            "items": {"type": "string"},
+        },
+        "quantified": {"type": "boolean"},
+        "cited_capex_usd_m": {"type": ["number", "null"]},
+        "cited_capacity": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["value", "unit"],
+            "properties": {
+                "value": {"type": ["number", "string", "null"]},
+                "unit": {"type": ["string", "null"]},
+            },
+        },
+        "earnings_bridge": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "revenue_growth_bps", "gross_margin_bps",
+                "ebitda_margin_bps", "backlog_growth_pct",
+            ],
+            "properties": {
+                "revenue_growth_bps": {"type": ["number", "null"]},
+                "gross_margin_bps": {"type": ["number", "null"]},
+                "ebitda_margin_bps": {"type": ["number", "null"]},
+                "backlog_growth_pct": {"type": ["number", "null"]},
+            },
+        },
+        "price_target_delta_pct": {"type": "number"},
+        "recommendation": {"type": "string", "enum": sorted(_RECOMMENDATIONS)},
+        "headline": {"type": "string"},
+        "supply_chain_driver": {"type": "string"},
+        "analysis": {"type": "string"},
+        "financial_impact_thesis": {"type": "string"},
+    },
+}
+
 _SYSTEM_INSTRUCTION = (
     "You are a Senior Supply-Chain Equity Analyst on a Wall Street "
     "infrastructure desk. You read full news articles and regulatory filings "
-    "and isolate SUPPLY-SIDE catalysts: capacity additions, lead-time shifts, "
-    "physical CapEx deployments, long-term off-take / take-or-pay agreements, "
-    "power PPAs, and manufacturing bottlenecks — across advanced compute, "
-    "hyperscale cloud, critical energy, critical minerals, and physical AI / "
-    "robotics.\n\n"
-    "METHOD:\n"
-    "1. Judge the article ONLY on what its text substantiates — specific dollar "
-    "amounts, capacity figures (GW, tons, wafers, units), named facilities, "
-    "counterparties, and timelines. A strong headline with no supporting body "
-    "is noise.\n"
-    "2. Project the estimated financial impact: shift in revenue growth rate, "
-    "gross/EBITDA margin expansion in basis points, and/or backlog growth.\n"
-    "3. Derive a 12-month price-target delta as a percent, from plausible "
-    "EV/EBITDA or P/E multiple change plus the earnings impact. If a current "
-    "share price appears in the text, also compute implied_price_target = "
-    "current_price * (1 + price_target_delta_pct/100); otherwise set it null.\n\n"
-    "conviction_score (1-10), strict:\n"
-    "  1-4  = noise: opinion/analysis columns, analyst price-target or rating "
-    "changes, stock-move recaps, rumor/'could'/'may' pieces, listicles, "
-    "specifics-free PR.\n"
-    "  5-7  = a real but not decision-grade supply development (incremental, "
-    "vague, small or unquantified).\n"
-    "  8    = a concrete, committed capacity / supply-chain catalyst specific "
-    "to THIS company.\n"
-    "  9-10 = a decisive supply-side shift with quantified capital or capacity "
-    "and named assets / counterparties.\n"
-    "If the article is primarily about a different company, cap at 5. "
-    "Speculation or no concrete physical/capital fact => below 8.\n\n"
-    "recommendation must be one of: \"HIGH CONVICTION BUY\", \"BUY\", "
-    "\"NEUTRAL / WATCH\", \"AVOID\".\n"
-    "supply_chain_driver: a short phrase, ideally one of \"CapEx Expansion\", "
-    "\"Bottleneck Relief\", \"Power PPA\", \"Raw Material Off-take\", "
-    "\"Capacity Addition\", \"Lead-Time Shift\" (or a close variant).\n\n"
-    "Respond with ONLY a JSON object with EXACTLY these keys:\n"
-    "{\n"
-    '  "conviction_score": int 1-10,\n'
-    '  "recommendation": string,\n'
-    '  "headline": string,  // crisp Bloomberg/Reuters style, grounded in the text\n'
-    '  "supply_chain_driver": string,\n'
-    '  "price_target_delta_pct": number,  // signed percent, e.g. 12.5 or -4.0\n'
-    '  "implied_price_target": number or null,\n'
-    '  "analysis": string,  // two concise sentences of Wall Street commentary\n'
-    '  "financial_impact_thesis": string  // revenue / EBITDA margin / backlog breakdown\n'
-    "}"
+    "and isolate SUPPLY-SIDE catalysts: committed CapEx, capacity additions, "
+    "lead-time shifts, long-term off-take / take-or-pay agreements, power PPAs, "
+    "and manufacturing bottlenecks — across advanced compute, hyperscale cloud, "
+    "critical energy, critical minerals, and physical AI / robotics.\n\n"
+    "RULES:\n"
+    "- Judge ONLY on what the supplied text substantiates. Put 1-3 VERBATIM "
+    "quotes from the text into 'evidence_quotes' that support your catalyst "
+    "call. If you cannot find a concrete quote, the item is not decision-grade.\n"
+    "- 'is_primary_issuer' is true only if the article is chiefly about THIS "
+    "company (named in the header), not a peer.\n"
+    "- 'quantified' is true only if the text gives a hard figure: a dollar "
+    "CapEx amount, a capacity number (GW, tons, wafers, units), or a contract "
+    "size/term. Fill 'cited_capex_usd_m' (USD millions) and 'cited_capacity' "
+    "when present, else null.\n"
+    "- 'catalyst_type': use 'plan_or_rumor' for 'could/may/exploring/considering' "
+    "items and 'not_supply_side' for opinion columns, price-target/rating "
+    "changes, stock-move recaps, and generic PR.\n"
+    "- 'earnings_bridge': your estimate of the impact (basis points / percent), "
+    "nulls where you cannot estimate.\n"
+    "- 'price_target_delta_pct': signed 12-month percent from multiple + "
+    "earnings impact. Do NOT invent a spot price; the system computes the "
+    "implied target from the article text.\n"
+    "- 'conviction_score' 1-10: 1-4 noise, 5-7 real but soft, 8 concrete "
+    "committed company-specific catalyst, 9-10 decisive quantified shift with "
+    "named assets/counterparties.\n"
+    "- 'recommendation': one of HIGH CONVICTION BUY, BUY, NEUTRAL / WATCH, AVOID.\n"
+    "- 'headline': crisp Bloomberg/Reuters style, grounded in the text. "
+    "'analysis': two sentences. 'financial_impact_thesis': revenue / margin "
+    "(bps) / backlog breakdown.\n\n"
+    "Return ONLY the JSON object matching the schema."
 )
 
 
-def _fallback(reason: str, kind: str = "other") -> dict[str, Any]:
-    return {
-        "conviction_score": 1,
-        "recommendation": "AVOID",
-        "headline": "",
-        "supply_chain_driver": "",
-        "price_target_delta_pct": None,
-        "implied_price_target": None,
-        "analysis": "",
-        "financial_impact_thesis": "",
-        "valid": False,
-        "error": reason,
-        "error_kind": kind,  # auth | quota | parse | network | other
-    }
+# ------------------------------------------------------------------- helpers
 
-
-_RECOMMENDATIONS = {
-    "HIGH CONVICTION BUY", "BUY", "NEUTRAL / WATCH", "AVOID",
-}
+def _finite(x: float) -> bool:
+    return x == x and x not in (float("inf"), float("-inf"))
 
 
 def _num(value: Any) -> float | None:
-    """Coerce an LLM-supplied number to float, or None if it isn't usable."""
+    """Coerce an LLM-supplied number to float, or None if unusable."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return float(value) if _finite(float(value)) else None
-    text = str(value).strip().replace("%", "").replace("$", "").replace(",", "")
-    text = text.lstrip("+")
+    text = str(value).strip().replace("%", "").replace("$", "").replace(",", "").lstrip("+")
     m = re.search(r"-?\d+(?:\.\d+)?", text)
     if not m:
         return None
@@ -159,33 +186,70 @@ def _num(value: Any) -> float | None:
     return num if _finite(num) else None
 
 
-def _finite(x: float) -> bool:
-    return x == x and x not in (float("inf"), float("-inf"))
+_SPOT_RE = re.compile(
+    r"(?:shares?|stock|share price)\b(?![^.$\n]{0,40}target)[^.$\n]{0,40}?"
+    r"\$\s?(\d{1,5}(?:\.\d{1,2})?)"
+    r"|(?:trade[sd]?|trading|closed?|changed hands|last (?:traded|closed))\b"
+    r"(?![^.$\n]{0,40}target)[^.$\n]{0,40}?\$\s?(\d{1,5}(?:\.\d{1,2})?)"
+    r"|\$\s?(\d{1,5}(?:\.\d{1,2})?)\s?(?:per share|/ ?share|a share)",
+    re.I,
+)
+
+
+def parse_spot_price(text: str) -> float | None:
+    """
+    Extract a plausible current share price from article text.
+
+    Only matches a '$' figure sitting next to price/trading/share language and
+    NOT next to the word "target", so the model can't smuggle in an invented
+    number and analyst-target figures don't leak through. Returns None if
+    nothing clearly price-like is found or the value is out of equity range.
+    """
+    if not text:
+        return None
+    for m in _SPOT_RE.finditer(text):
+        raw = m.group(1) or m.group(2) or m.group(3)
+        val = _num(raw)
+        if val is not None and 0.5 <= val <= 10000:
+            return round(val, 2)
+    return None
+
+
+def _fallback(reason: str, kind: str = "other") -> dict[str, Any]:
+    return {
+        "conviction_score": 1,
+        "recommendation": "AVOID",
+        "headline": "",
+        "supply_chain_driver": "",
+        "catalyst_type": "not_supply_side",
+        "is_primary_issuer": False,
+        "quantified": False,
+        "evidence_quotes": [],
+        "cited_capex_usd_m": None,
+        "cited_capacity": None,
+        "earnings_bridge": {},
+        "price_target_delta_pct": 0.0,
+        "implied_price_target": None,
+        "analysis": "",
+        "financial_impact_thesis": "",
+        "valid": False,
+        "gate": "error",
+        "error": reason,
+        "error_kind": kind,  # auth | quota | parse | network | other
+    }
 
 
 def _looks_like_quota(text: str) -> bool:
     t = (text or "").lower()
-    return any(
-        s in t
-        for s in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit")
-    )
+    return any(s in t for s in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit"))
 
 
 def _looks_like_auth(text: str) -> bool:
     t = (text or "").lower()
-    return any(
-        s in t
-        for s in (
-            "invalid api key",
-            "api key not valid",
-            "invalid_api_key",
-            "unauthenticated",
-            "unauthorized",
-            "permission_denied",
-            "401",
-            "403",
-        )
-    )
+    return any(s in t for s in (
+        "invalid api key", "api key not valid", "invalid_api_key", "unauthenticated",
+        "unauthorized", "permission_denied", "401", "403",
+    ))
 
 
 def _mentions_daily(text: str) -> bool:
@@ -197,7 +261,6 @@ _RETRY_DELAY_RE = re.compile(r"try again in ([\d.]+)\s*(m|min|s|ms)?", re.I)
 
 
 def _retry_delay(resp: requests.Response, body: str) -> float:
-    """Seconds to wait before retrying a 429 — from the header or the body text."""
     header = resp.headers.get("retry-after")
     if header:
         try:
@@ -228,29 +291,55 @@ def _post(payload: dict[str, Any]) -> requests.Response:
     )
 
 
+_USE_JSON_SCHEMA = True  # flipped off at runtime if the backend rejects it
+
+
 def _chat(prompt: str) -> str:
     """
-    One chat completion. Returns the raw message content (expected to be JSON).
+    One chat completion returning the raw JSON message content.
 
-    Retries a short per-minute 429 up to _MAX_ATTEMPTS times, sleeping the
-    delay the API asks for. Raises LLMQuotaError only when the limit is a daily
-    cap, the wait exceeds _MAX_RETRY_AFTER, or the retries are exhausted.
+    Retries a short per-minute 429 up to _MAX_ATTEMPTS times. Raises
+    LLMQuotaError on a daily cap / exhausted retries.
     """
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_INSTRUCTION},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 900,
-        "response_format": {"type": "json_object"},
-    }
-    if LLM_REASONING_EFFORT:
-        payload["reasoning_effort"] = LLM_REASONING_EFFORT
+    global _USE_JSON_SCHEMA
 
-    resp = _post(payload)
-    for attempt in range(1, _MAX_ATTEMPTS):
+    def _payload() -> dict[str, Any]:
+        p: dict[str, Any] = {
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_INSTRUCTION},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.15,
+            "max_tokens": 1100,
+        }
+        if _USE_JSON_SCHEMA:
+            p["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "supply_side_verdict",
+                    "schema": _RESPONSE_SCHEMA,
+                    "strict": True,
+                },
+            }
+        else:
+            p["response_format"] = {"type": "json_object"}
+        if LLM_REASONING_EFFORT:
+            p["reasoning_effort"] = LLM_REASONING_EFFORT
+        return p
+
+    resp = _post(_payload())
+
+    # One-time downgrade if the backend can't do json_schema response_format.
+    if (resp.status_code == 400 and _USE_JSON_SCHEMA
+            and "response_format" in resp.text.lower()
+            and "schema" in resp.text.lower()):
+        print(f"[analyzer] json_schema rejected, falling back to json_object: "
+              f"{resp.text[:200]}")
+        _USE_JSON_SCHEMA = False
+        resp = _post(_payload())
+
+    for _ in range(1, _MAX_ATTEMPTS):
         if resp.status_code != 429:
             break
         body = resp.text[:500]
@@ -258,7 +347,7 @@ def _chat(prompt: str) -> str:
         if _mentions_daily(body) or not delay or delay > _MAX_RETRY_AFTER:
             raise LLMQuotaError(body)
         time.sleep(delay + 1.0)
-        resp = _post(payload)
+        resp = _post(_payload())
     if resp.status_code == 429:
         raise LLMQuotaError(resp.text[:500])
 
@@ -273,13 +362,11 @@ def _chat(prompt: str) -> str:
             raise LLMQuotaError(body[:300]) from exc
         raise
 
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    return resp.json()["choices"][0]["message"]["content"]
 
 
-def _parse_verdict(raw: str) -> dict[str, Any]:
+def _parse_verdict(raw: str, source_text: str) -> dict[str, Any]:
     raw = (raw or "").strip()
-    # Some models wrap JSON in ```json fences.
     if raw.startswith("```"):
         raw = raw.strip("`")
         raw = raw[4:] if raw.lower().startswith("json") else raw
@@ -295,38 +382,83 @@ def _parse_verdict(raw: str) -> dict[str, Any]:
         val = str(data.get(key, "") or "").strip()
         return "" if val.lower() in ("none", "null", "n/a", "na", "-") else val
 
-    score_num = _num(data.get("conviction_score"))
-    score = int(round(score_num)) if score_num is not None else 0
-    score = max(1, min(10, score))
+    model_score = _num(data.get("conviction_score"))
+    model_score = int(round(model_score)) if model_score is not None else 0
+    model_score = max(1, min(10, model_score))
 
     headline = _text("headline")
     analysis = _text("analysis")
     thesis = _text("financial_impact_thesis")
     driver = _text("supply_chain_driver")
 
+    is_primary = bool(data.get("is_primary_issuer"))
+    quantified = bool(data.get("quantified"))
+    catalyst = str(data.get("catalyst_type", "not_supply_side")).strip().lower()
+    if catalyst not in _CATALYST_TYPES:
+        catalyst = "not_supply_side"
+
+    quotes_raw = data.get("evidence_quotes") or []
+    if isinstance(quotes_raw, str):
+        quotes_raw = [quotes_raw]
+    quotes = [q.strip() for q in quotes_raw if isinstance(q, str) and q.strip()][:3]
+
+    # ---- code-level conviction gate -------------------------------------
+    gate_pass = (
+        is_primary
+        and quantified
+        and len(quotes) >= 2
+        and catalyst not in _DISQUALIFYING_CATALYSTS
+    )
+    if gate_pass:
+        score = model_score
+        gate = "pass"
+    else:
+        score = min(model_score, 7)  # can never be "valid"
+        gate = "blocked"
+
+    # ---- price target: quantified-gated, clamped, spot from TEXT only ---
+    delta = _num(data.get("price_target_delta_pct")) or 0.0
+    if not quantified or not gate_pass:
+        delta = 0.0
+    delta = max(-_MAX_ABS_DELTA_PCT, min(_MAX_ABS_DELTA_PCT, delta))
+
+    spot = parse_spot_price(source_text)
+    implied = None
+    if spot is not None and delta:
+        implied = round(spot * (1 + delta / 100.0), 2)
+
     rec = str(data.get("recommendation", "")).strip().upper()
     if rec not in _RECOMMENDATIONS:
         rec = "HIGH CONVICTION BUY" if score >= 9 else (
             "BUY" if score >= 8 else "NEUTRAL / WATCH" if score >= 5 else "AVOID"
         )
+    if not gate_pass and rec in ("HIGH CONVICTION BUY", "BUY"):
+        rec = "NEUTRAL / WATCH"
 
-    delta = _num(data.get("price_target_delta_pct"))
-    if delta is not None and abs(delta) > 200:  # implausible model output
-        delta = None
-    target = _num(data.get("implied_price_target"))
-    if target is not None and target <= 0:
-        target = None
+    capex = _num(data.get("cited_capex_usd_m"))
+    bridge = data.get("earnings_bridge")
+    if not isinstance(bridge, dict):
+        bridge = {}
 
     return {
         "conviction_score": score,
         "recommendation": rec,
         "headline": headline,
         "supply_chain_driver": driver,
-        "price_target_delta_pct": delta,
-        "implied_price_target": target,
+        "catalyst_type": catalyst,
+        "is_primary_issuer": is_primary,
+        "quantified": quantified,
+        "evidence_quotes": quotes,
+        "cited_capex_usd_m": capex,
+        "cited_capacity": data.get("cited_capacity") if isinstance(data.get("cited_capacity"), dict) else None,
+        "earnings_bridge": bridge,
+        "price_target_delta_pct": round(delta, 2),
+        "implied_price_target": implied,
+        "spot_price": spot,
         "analysis": analysis,
         "financial_impact_thesis": thesis,
-        "valid": score >= 8 and bool(headline) and bool(analysis),
+        "gate": gate,
+        "valid": gate_pass and score >= 8 and bool(headline) and bool(analysis),
     }
 
 
@@ -338,17 +470,17 @@ def evaluate_item(
     ticker: str | None = None,
 ) -> dict[str, Any]:
     """
-    Grade a single raw item with the configured LLM.
+    Grade a single raw item with the configured LLM, then code-gate the verdict.
 
-    Returns a dict with 'conviction_score' (1-10), 'recommendation', 'headline',
-    'supply_chain_driver', 'price_target_delta_pct' (float|None),
-    'implied_price_target' (float|None), 'analysis', 'financial_impact_thesis',
-    and 'valid' (True only when score >= 8). On a handled failure the same shape
-    is returned with 'error'/'error_kind' set and 'valid' False.
+    Returns a dict with conviction_score, recommendation, headline,
+    supply_chain_driver, catalyst_type, is_primary_issuer, quantified,
+    evidence_quotes, cited_capex_usd_m, cited_capacity, earnings_bridge,
+    price_target_delta_pct (clamped ±25), implied_price_target (spot parsed
+    from the text × delta, else None), analysis, financial_impact_thesis,
+    'gate' ('pass' | 'blocked' | 'error'), and 'valid'.
 
     Raises:
-        LLMQuotaError: when the API quota/rate limit is exhausted, so the caller
-            can stop the run cleanly instead of burning the whole batch.
+        LLMQuotaError: when the API quota/rate limit is exhausted.
     """
     snippet = (text_snippet or "").strip()
     if len(snippet) < 20:
@@ -378,4 +510,4 @@ def evaluate_item(
     except (KeyError, IndexError, ValueError) as exc:
         return _fallback(f"malformed llm response: {exc}", kind="parse")
 
-    return _parse_verdict(content)
+    return _parse_verdict(content, snippet)

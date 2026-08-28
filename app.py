@@ -364,6 +364,65 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------- Executive Top Picks Hero Section
+top_picks = [
+    s for s in signals 
+    if "BUY" in str(s.get("recommendation", "")).upper() 
+    and int(s.get("conviction_score", 0)) >= 8
+]
+
+# Rank top picks by price target delta percentage (descending)
+top_picks.sort(
+    key=lambda x: float(x.get("price_target_delta_pct") or 0.0), 
+    reverse=True
+)
+
+if top_picks:
+    st.markdown("### 🎯 EXECUTIVE TOP PICKS")
+    st.caption("Highest-conviction strategic buy opportunities ranked by target upside & physical supply catalysts.")
+    
+    for pick in top_picks[:5]:
+        company = html.escape(str(pick.get("company", "—")))
+        headline = html.escape(str(pick.get("headline", "")))
+        rec = str(pick.get("recommendation", "HIGH CONVICTION BUY")).strip()
+        driver = str(pick.get("supply_chain_driver", "CapEx Expansion")).strip()
+        thesis = pick.get("financial_impact_thesis") or "No detailed financial bridge provided."
+        url = pick.get("url") or ""
+        score = pick.get("conviction_score", 8)
+        
+        delta = _fmt_num(pick.get("price_target_delta_pct"), suffix="%", signed=True)
+        target = _fmt_num(pick.get("implied_price_target"), prefix="$")
+        
+        with st.container(border=True):
+            col_ticker, col_driver, col_return, col_target = st.columns([2.2, 2, 1.4, 1.4])
+            
+            with col_ticker:
+                st.markdown(f"### **{company}**")
+                st.caption(f"Score: `{score}/10`  |  `{rec}`")
+            
+            with col_driver:
+                st.markdown("**Supply Driver**")
+                st.caption(f"`{driver}`")
+            
+            with col_return:
+                st.metric("Expected Upside", delta if delta else "N/A")
+            
+            with col_target:
+                st.metric("Price Target", target if target else "N/A")
+            
+            st.markdown(f"**Catalyst:** {headline}")
+            
+            with st.expander("🔍 Institutional Rationale & Thesis"):
+                st.markdown("#### **Financial Impact Thesis**")
+                st.info(thesis)
+                if url:
+                    st.markdown(f"[📄 **View Primary Source Article**]({url})")
+                    
+    st.markdown("---")
+
+# ---------------------------------------------------------------- Main Feed
+st.markdown("### 📡 ALL LIVE SIGNALS")
+
 if not signals:
     st.markdown(
         """
@@ -379,7 +438,7 @@ else:
         render_card(signal)
 
 
-# ---------------------------------------------------------------- scan audit
+# ---------------------------------------------------------------- Scan Audit
 st.markdown("---")
 with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded=False):
     logs = load_scan_logs(50)
@@ -394,10 +453,14 @@ with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded
                 "Domain": row.get("domain") or "—",
                 "Collected": int(row.get("raw_collected") or 0),
                 "Graded": int(row.get("raw_items_count") or 0),
-                "Signals Saved": int(row.get("signals_found") or 0),
+                "Signals": int(row.get("signals_found") or 0),
+                "Drop: unresolved": int(row.get("dropped_unresolved") or 0),
+                "Drop: paywall": int(row.get("dropped_paywall") or 0),
+                "Drop: short": int(row.get("dropped_short") or 0),
             }
             for row in logs
         ]
+        _numcol = st.column_config.NumberColumn(format="%d")
         st.dataframe(
             table,
             use_container_width=True,
@@ -409,17 +472,27 @@ with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded
                 "Graded": st.column_config.NumberColumn(
                     format="%d", help="New items actually sent to the LLM"
                 ),
-                "Signals Saved": st.column_config.NumberColumn(format="%d"),
+                "Signals": _numcol,
+                "Drop: unresolved": st.column_config.NumberColumn(
+                    format="%d", help="Google redirect could not be resolved"
+                ),
+                "Drop: paywall": st.column_config.NumberColumn(
+                    format="%d", help="Body was a paywall / teaser"
+                ),
+                "Drop: short": st.column_config.NumberColumn(
+                    format="%d", help="Extracted body under the minimum length"
+                ),
             },
         )
         total_collected = sum(r["Collected"] for r in table)
         total_graded = sum(r["Graded"] for r in table)
-        total_sig = sum(r["Signals Saved"] for r in table)
-        saved_pct = (
-            1 - total_graded / total_collected if total_collected else 0.0
+        total_sig = sum(r["Signals"] for r in table)
+        total_drop = sum(
+            r["Drop: unresolved"] + r["Drop: paywall"] + r["Drop: short"] for r in table
         )
+        saved_pct = 1 - total_graded / total_collected if total_collected else 0.0
         st.caption(
-            f"{len(table)} scans shown · {total_collected} collected · "
-            f"{total_graded} graded · {total_sig} signals · "
+            f"{len(table)} scans · {total_collected} collected · {total_graded} graded · "
+            f"{total_sig} signals · {total_drop} dropped · "
             f"{saved_pct:.0%} of LLM calls saved by URL dedup"
         )

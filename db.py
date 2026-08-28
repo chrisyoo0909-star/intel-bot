@@ -27,19 +27,22 @@ Supabase SQL editor; the outline below is kept in sync for reference):
         financial_impact_thesis  text,
         created_at               timestamptz not null default now()
     );
-    -- Prevent duplicate high-conviction entries for the same story.
-    alter table signals
-        add constraint signals_company_headline_key unique (company, headline);
+    -- One signal per story: two unique constraints, upserted against.
+    alter table signals add constraint signals_company_headline_key unique (company, headline);
+    alter table signals add constraint signals_url_key unique (url);
 
     create table if not exists scan_logs (
-        id                uuid primary key default gen_random_uuid(),
-        company_symbol    text,
-        company_name      text,
-        domain            text,
-        raw_collected     int  not null default 0,  -- items found before dedup
-        raw_items_count   int  not null default 0,  -- items actually graded
-        signals_found     int  not null default 0,
-        scanned_at        timestamptz not null default now()
+        id                 uuid primary key default gen_random_uuid(),
+        company_symbol     text,
+        company_name       text,
+        domain             text,
+        raw_collected      int  not null default 0,  -- items found before dedup
+        raw_items_count    int  not null default 0,  -- items actually graded
+        signals_found      int  not null default 0,
+        dropped_unresolved int  not null default 0,
+        dropped_paywall    int  not null default 0,
+        dropped_short      int  not null default 0,
+        scanned_at         timestamptz not null default now()
     );
     create index if not exists scan_logs_scanned_at_idx
         on scan_logs (scanned_at desc);
@@ -319,14 +322,17 @@ def save_signal(
     """
     Persist a high-conviction signal (score >= 8) into the 'signals' table.
 
-    Upserts on the (company, headline) unique constraint so re-encountering the
-    same story refreshes its fields instead of creating a duplicate. 'created_at'
-    is omitted so the original first-seen timestamp is preserved on updates.
+    The table carries two unique constraints — UNIQUE(url) and
+    UNIQUE(company, headline). This upserts on 'url' when a URL is present (one
+    signal per source story) and falls back to updating the (company, headline)
+    row if that constraint is the one that collides. 'created_at' is omitted so
+    the original first-seen timestamp is preserved on updates.
 
-    Numeric fields (price_target_delta_pct, implied_price_target) are coerced
-    with a graceful fallback to NULL — a bad model value never breaks the write.
+    Numeric fields are coerced with a graceful fallback to NULL — a bad model
+    value never breaks the write.
 
-    Returns True when a row was written/updated, False when score < 8.
+    Returns True on a successful write/update. Raises on an unhandled DB error
+    (the caller must then NOT mark the item seen).
     """
     if score < 8:
         return False
@@ -336,27 +342,43 @@ def save_signal(
         "conviction_score": int(score),
         "headline": headline,
         "analysis": analysis,
-        "url": url,
+        "url": url or None,
         "recommendation": (recommendation or None),
         "supply_chain_driver": (supply_chain_driver or None),
         "price_target_delta_pct": _to_number(price_target_delta_pct),
         "implied_price_target": _to_number(implied_price_target),
         "financial_impact_thesis": (financial_impact_thesis or None),
     }
-    try:
-        _supabase.table("signals").upsert(row, on_conflict="company,headline").execute()
-    except Exception as exc:
-        # Older 'signals' table without the analyst columns -> retry with the
-        # core fields only so the signal is still captured.
-        if "column" in str(exc).lower() or "schema cache" in str(exc).lower():
-            core = {k: row[k] for k in (
-                "company", "domain", "conviction_score", "headline", "analysis", "url"
-            )}
-            _supabase.table("signals").upsert(core, on_conflict="company,headline").execute()
-            print(f"[db] Saved signal (core fields only — run schema.sql) "
-                  f"[{score}/10] {company}: {headline}")
-            return True
-        raise
+
+    def _core(r: dict[str, Any]) -> dict[str, Any]:
+        return {k: r[k] for k in (
+            "company", "domain", "conviction_score", "headline", "analysis", "url"
+        )}
+
+    def _write(r: dict[str, Any]) -> None:
+        conflict = "url" if r.get("url") else "company,headline"
+        try:
+            _supabase.table("signals").upsert(r, on_conflict=conflict).execute()
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "column" in msg or "schema cache" in msg:
+                # analyst columns not migrated yet -> core fields only
+                _supabase.table("signals").upsert(
+                    _core(r), on_conflict=conflict
+                ).execute()
+                print("[db] (core fields only — run schema.sql)")
+                return
+            if ("company_headline" in msg or "company, headline" in msg
+                    or "signals_company_headline_key" in msg):
+                # the OTHER constraint collided: update that row in place
+                upd = {k: v for k, v in r.items() if k != "url"}
+                _supabase.table("signals").update(upd).eq(
+                    "company", r["company"]
+                ).eq("headline", r["headline"]).execute()
+                return
+            raise
+
+    _write(row)
     tgt = row["implied_price_target"]
     dlt = row["price_target_delta_pct"]
     extra = f" | {row['recommendation']}"
@@ -396,14 +418,17 @@ def log_scan(
     raw_items_count: int,
     signals_found: int,
     raw_collected: int | None = None,
+    drops: dict[str, int] | None = None,
 ) -> None:
     """
     Record one company's scan outcome in the 'scan_logs' audit table.
 
     ``raw_collected`` is the item count found before URL de-duplication;
-    ``raw_items_count`` is what was actually sent to the LLM. The gap between
-    them is the quota saved by the seen_urls filter.
+    ``raw_items_count`` is what was actually sent to the LLM. ``drops`` counts
+    items discarded by the scraper, keyed unresolved_google / paywall_teaser /
+    short_body.
     """
+    drops = drops or {}
     row = {
         "company_symbol": company_symbol,
         "company_name": company_name,
@@ -411,17 +436,37 @@ def log_scan(
         "raw_collected": int(raw_collected if raw_collected is not None else raw_items_count),
         "raw_items_count": int(raw_items_count),
         "signals_found": int(signals_found),
+        "dropped_unresolved": int(drops.get("unresolved_google", 0)),
+        "dropped_paywall": int(drops.get("paywall_teaser", 0)),
+        "dropped_short": int(drops.get("short_body", 0)),
         "scanned_at": _utcnow_iso(),
     }
     try:
         _supabase.table("scan_logs").insert(row).execute()
-        print(
-            f"[db] scan_logs += {company_symbol} "
-            f"(collected={row['raw_collected']}, graded={raw_items_count}, "
-            f"signals={signals_found})"
-        )
-    except Exception as exc:  # never let audit logging break a scan
-        print(f"[db] WARNING: could not write scan_logs for {company_symbol}: {exc}")
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "column" in msg or "schema cache" in msg:
+            legacy = {k: row[k] for k in (
+                "company_symbol", "company_name", "domain", "raw_collected",
+                "raw_items_count", "signals_found", "scanned_at",
+            )}
+            try:
+                _supabase.table("scan_logs").insert(legacy).execute()
+            except Exception as exc2:
+                print(f"[db] WARNING: scan_logs write failed for {company_symbol}: {exc2}")
+                return
+        else:
+            print(f"[db] WARNING: could not write scan_logs for {company_symbol}: {exc}")
+            return
+    drop_str = ", ".join(
+        f"{k}={row[k]}" for k in ("dropped_unresolved", "dropped_paywall", "dropped_short")
+        if row[k]
+    )
+    print(
+        f"[db] scan_logs += {company_symbol} "
+        f"(collected={row['raw_collected']}, graded={raw_items_count}, "
+        f"signals={signals_found}" + (f", {drop_str}" if drop_str else "") + ")"
+    )
 
 
 def prune_scan_logs(keep: int = SCAN_LOG_RETENTION) -> int:
@@ -459,14 +504,21 @@ def prune_scan_logs(keep: int = SCAN_LOG_RETENTION) -> int:
 
 def fetch_scan_logs(limit: int = 50) -> list[dict[str, Any]]:
     """Read the most recent scan audit rows, newest first."""
-    resp = (
-        _supabase.table("scan_logs")
-        .select("scanned_at, company_symbol, company_name, domain, "
-                "raw_collected, raw_items_count, signals_found")
-        .order("scanned_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
+    cols = ("scanned_at, company_symbol, company_name, domain, raw_collected, "
+            "raw_items_count, signals_found, dropped_unresolved, "
+            "dropped_paywall, dropped_short")
+    try:
+        resp = (
+            _supabase.table("scan_logs").select(cols)
+            .order("scanned_at", desc=True).limit(limit).execute()
+        )
+    except Exception:
+        resp = (
+            _supabase.table("scan_logs")
+            .select("scanned_at, company_symbol, company_name, domain, "
+                    "raw_collected, raw_items_count, signals_found")
+            .order("scanned_at", desc=True).limit(limit).execute()
+        )
     return resp.data or []
 
 

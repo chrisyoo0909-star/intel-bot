@@ -119,18 +119,19 @@ def _run_scan() -> int:
         print(f"\n[{idx}/{len(batch)}] {name} ({ticker}) — {domain}")
 
         try:
-            result = gather_raw_items(ticker, name)
+            result = gather_raw_items(ticker, name, budget=MAX_ITEMS_PER_COMPANY)
         except Exception as exc:
+            # Unhandled scrape failure -> do NOT stamp last_scanned; retry next
+            # cycle. Still record the attempt for audit visibility.
             print(f"  ! scrape failed: {exc}")
             traceback.print_exc()
             log_scan(ticker, name, domain, raw_items_count=0, signals_found=0,
                      raw_collected=0)
-            processed_ids.append(cid)
             continue
 
         raw_items = result.items[:MAX_ITEMS_PER_COMPANY]
         company_signals = 0
-        graded_items: list[dict] = []
+        graded_items: list[dict] = []   # only items safely persisted / judged
 
         for j, item in enumerate(raw_items, start=1):
             total_items += 1
@@ -142,34 +143,35 @@ def _run_scan() -> int:
             except LLMQuotaError as exc:
                 stats.quota_hit = True
                 print(f"  !! LLM quota exhausted: {exc}")
-                print("  !! Stopping this run cleanly; unprocessed companies "
-                      "keep their old last_scanned and are retried next cycle.")
-                # Finalize just what completed so far.
+                print("  !! Stopping cleanly; THIS company is left unstamped and "
+                      "retried next cycle.")
                 mark_items_seen(graded_items, company_symbol=ticker)
                 log_scan(ticker, name, domain, raw_items_count=j - 1,
-                         signals_found=company_signals, raw_collected=result.collected)
-                processed_ids.append(cid)
+                         signals_found=company_signals, raw_collected=result.collected,
+                         drops=result.drops)
+                # NOTE: cid is intentionally NOT added to processed_ids.
                 return _finalize(stats, processed_ids, total_items, total_signals,
                                  saved_signals, aborted=True)
 
             stats.record(verdict)
-            # Only fingerprint items the LLM actually judged; a transient API
-            # error leaves the URL unseen so the next run retries it.
-            if "error" not in verdict:
-                graded_items.append(item)
             score = verdict["conviction_score"]
+            is_error = "error" in verdict
             flag = "SIGNAL" if verdict["valid"] else (
-                f"ERR:{verdict.get('error_kind', '?')}" if "error" in verdict
-                else "filler"
+                f"ERR:{verdict.get('error_kind', '?')}" if is_error
+                else ("BLOCKED" if verdict.get("gate") == "blocked" else "filler")
             )
             delta = verdict.get("price_target_delta_pct")
-            delta_str = f" {delta:+.1f}%" if isinstance(delta, (int, float)) else ""
+            delta_str = f" {delta:+.1f}%" if isinstance(delta, (int, float)) and delta else ""
             print(
                 f"    ({j}/{len(raw_items)}) [{score}/10 {flag}]{delta_str} "
-                f"{item.get('title', '')[:64]}"
+                f"{item.get('title', '')[:62]}"
             )
 
-            if verdict["valid"]:
+            mark_ok = False
+            if is_error:
+                # LLM failure: leave the URL unseen so the next run retries it.
+                mark_ok = False
+            elif verdict["valid"]:
                 try:
                     written = save_signal(
                         company=name,
@@ -184,26 +186,33 @@ def _run_scan() -> int:
                         implied_price_target=verdict.get("implied_price_target"),
                         financial_impact_thesis=verdict.get("financial_impact_thesis"),
                     )
-                except Exception as exc:  # a DB write must not kill the scan
+                except Exception as exc:
+                    # DB write failed -> do NOT mark seen; retry next cycle.
                     written = False
-                    print(f"      ! save_signal failed: {exc}")
+                    print(f"      ! save_signal error, item left unseen: {exc}")
+                mark_ok = bool(written)
                 if written:
                     company_signals += 1
                     total_signals += 1
-                    saved_signals.append(
-                        {
-                            "company": name,
-                            "score": score,
-                            "headline": verdict["headline"],
-                        }
-                    )
+                    saved_signals.append({
+                        "company": name, "score": score,
+                        "headline": verdict["headline"],
+                        "rec": verdict.get("recommendation"),
+                        "delta": verdict.get("price_target_delta_pct"),
+                        "target": verdict.get("implied_price_target"),
+                    })
+            else:
+                # Legitimately graded below threshold, no DB write attempted.
+                mark_ok = True
+
+            if mark_ok:
+                graded_items.append(item)
 
             time.sleep(ITEM_PACING_SECONDS)
 
-        # Fingerprint every graded URL so it is never re-sent to the LLM.
+        # Fingerprint only URLs that were persisted or cleanly judged sub-threshold.
         mark_items_seen(graded_items, company_symbol=ticker)
 
-        # Audit-log this company's outcome immediately after it finishes.
         log_scan(
             company_symbol=ticker,
             company_name=name,
@@ -211,6 +220,7 @@ def _run_scan() -> int:
             raw_items_count=len(raw_items),
             signals_found=company_signals,
             raw_collected=result.collected,
+            drops=result.drops,
         )
 
         print(f"  => {company_signals} high-conviction signal(s) from {name}.")
@@ -246,7 +256,14 @@ def _finalize(
     if saved_signals:
         print("\n  Top signals:")
         for s in sorted(saved_signals, key=lambda x: -x["score"]):
-            print(f"    [{s['score']}/10] {s['company']}: {s['headline']}")
+            d = s.get("delta")
+            t = s.get("target")
+            tag = f" | {s.get('rec')}" if s.get("rec") else ""
+            if isinstance(d, (int, float)) and d:
+                tag += f" {d:+.1f}%"
+            if isinstance(t, (int, float)):
+                tag += f" -> ${t}"
+            print(f"    [{s['score']}/10] {s['company']}: {s['headline']}{tag}")
     else:
         print("\n  No high-conviction breakthroughs this cycle.")
 

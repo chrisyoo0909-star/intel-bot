@@ -42,17 +42,18 @@ alter table signals add column if not exists implied_price_target    numeric;
 alter table signals add column if not exists supply_chain_driver     text;
 alter table signals add column if not exists financial_impact_thesis text;
 
--- Collapse any pre-existing duplicates, keeping the newest row per story ...
-delete from signals s
-using signals d
-where s.company = d.company
-  and s.headline = d.headline
-  and s.id < d.id;
+-- Collapse pre-existing duplicates (keep the newest row) before adding the
+-- unique constraints save_signal() upserts against.
+delete from signals s using signals d
+ where s.company = d.company and s.headline = d.headline and s.id < d.id;
+delete from signals s using signals d
+ where s.url = d.url and s.url is not null and s.id < d.id;
 
--- ... then enforce uniqueness so save_signal() can upsert instead of insert.
 alter table signals drop constraint if exists signals_company_headline_key;
 alter table signals add  constraint signals_company_headline_key
     unique (company, headline);
+alter table signals drop constraint if exists signals_url_key;
+alter table signals add  constraint signals_url_key unique (url);
 
 -- ── scan_logs (audit trail, FIFO-pruned by the bot) ───────────────────────
 create table if not exists scan_logs (
@@ -60,18 +61,24 @@ create table if not exists scan_logs (
     company_symbol    text,
     company_name      text,
     domain            text,
-    raw_collected     int  not null default 0,  -- items found before URL dedup
-    raw_items_count   int  not null default 0,  -- items actually sent to the LLM
-    signals_found     int  not null default 0,
-    scanned_at        timestamptz not null default now()
+    raw_collected      int  not null default 0,  -- items found before URL dedup
+    raw_items_count    int  not null default 0,  -- items actually sent to the LLM
+    signals_found      int  not null default 0,
+    dropped_unresolved int  not null default 0,  -- google redirect not resolvable
+    dropped_paywall    int  not null default 0,  -- paywall / teaser body
+    dropped_short      int  not null default 0,  -- body under MIN_BODY chars
+    scanned_at         timestamptz not null default now()
 );
-alter table scan_logs add column if not exists company_symbol  text;
-alter table scan_logs add column if not exists company_name    text;
-alter table scan_logs add column if not exists domain          text;
-alter table scan_logs add column if not exists raw_collected   int not null default 0;
-alter table scan_logs add column if not exists raw_items_count int not null default 0;
-alter table scan_logs add column if not exists signals_found   int not null default 0;
-alter table scan_logs add column if not exists scanned_at      timestamptz not null default now();
+alter table scan_logs add column if not exists company_symbol     text;
+alter table scan_logs add column if not exists company_name       text;
+alter table scan_logs add column if not exists domain             text;
+alter table scan_logs add column if not exists raw_collected      int not null default 0;
+alter table scan_logs add column if not exists raw_items_count    int not null default 0;
+alter table scan_logs add column if not exists signals_found      int not null default 0;
+alter table scan_logs add column if not exists dropped_unresolved int not null default 0;
+alter table scan_logs add column if not exists dropped_paywall    int not null default 0;
+alter table scan_logs add column if not exists dropped_short      int not null default 0;
+alter table scan_logs add column if not exists scanned_at         timestamptz not null default now();
 create index if not exists scan_logs_scanned_at_idx
     on scan_logs (scanned_at desc);
 
