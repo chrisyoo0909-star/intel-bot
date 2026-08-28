@@ -406,6 +406,48 @@ def fetch_signals(
     return resp.data or []
 
 
+def fetch_top_picks(limit: int = 6, days: int = 30) -> list[dict[str, Any]]:
+    """
+    Executive top picks: the highest-conviction recent signals, ranked by
+    conviction then expected 12-month upside.
+
+    Reads the 'top_picks' view when present (see schema.sql) and otherwise
+    falls back to ranking the 'signals' table directly.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        resp = (
+            _supabase.table("top_picks")
+            .select("*")
+            .gte("created_at", since)
+            .limit(limit)
+            .execute()
+        )
+        if resp.data:
+            return resp.data
+    except Exception:
+        pass
+
+    base = (
+        _supabase.table("signals")
+        .select("*")
+        .gte("conviction_score", 8)
+        .gte("created_at", since)
+        .order("conviction_score", desc=True)
+    )
+    try:
+        resp = (
+            base.order("price_target_delta_pct", desc=True, nullsfirst=False)
+            .order("created_at", desc=True).limit(limit).execute()
+        )
+    except TypeError:
+        resp = (
+            base.order("price_target_delta_pct", desc=True)
+            .order("created_at", desc=True).limit(limit).execute()
+        )
+    return resp.data or []
+
+
 # ------------------------------------------------------------------ scan_logs
 
 SCAN_LOG_RETENTION = 500  # keep the newest N audit rows (FIFO rotation)

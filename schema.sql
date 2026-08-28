@@ -107,6 +107,26 @@ alter table scan_state add column if not exists locked_until timestamptz not nul
 alter table scan_state add column if not exists host         text;
 insert into scan_state (id) values ('singleton') on conflict (id) do nothing;
 
+-- ── top_picks (Executive Top Picks hero) ────────────────────────────────
+-- Highest-conviction signals, ranked by conviction then expected 12-month
+-- upside. Carries every signals column plus expected_return_pct so the
+-- dashboard hero (and any SQL consumer) can read it directly; app.py falls
+-- back to ranking 'signals' if the view is absent.
+-- DROP first: column set/order differs from earlier hand-made versions and
+-- CREATE OR REPLACE VIEW cannot change existing columns.
+drop view if exists top_picks;
+create view top_picks as
+select
+    s.*,
+    coalesce(s.price_target_delta_pct, 0)             as expected_return_pct,
+    round(abs(coalesce(s.price_target_delta_pct, 0))) as upside_bucket
+from signals s
+where s.conviction_score >= 8
+order by
+    s.conviction_score desc,
+    coalesce(s.price_target_delta_pct, 0) desc,
+    s.created_at desc;
+
 -- Force PostgREST to refresh its schema cache so the API sees new columns
 -- immediately (otherwise a PGRST204 "column not found" can linger ~seconds).
 notify pgrst, 'reload schema';

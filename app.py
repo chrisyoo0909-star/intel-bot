@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
-from db import fetch_scan_logs, fetch_signals
+from db import fetch_scan_logs, fetch_signals, fetch_top_picks
 
 st.set_page_config(
     page_title="Market Intelligence Terminal",
@@ -342,6 +342,85 @@ def load_scan_logs(limit: int = 50) -> list[dict]:
         return []
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_top_picks(limit: int = 6) -> list[dict]:
+    try:
+        return fetch_top_picks(limit=limit)
+    except Exception as exc:
+        st.warning(f"Top picks unavailable: {exc}")
+        return []
+
+
+def render_top_picks(picks: list[dict]) -> None:
+    """Executive hero: aggregate metrics + one bordered container per pick."""
+    st.markdown(
+        '<div class="terminal-sub" style="margin-top:0.4rem;">'
+        '🎯 EXECUTIVE TOP PICKS · HIGHEST CONVICTION, LAST 30 DAYS</div>',
+        unsafe_allow_html=True,
+    )
+    if not picks:
+        st.info("No qualifying high-conviction picks in the last 30 days. "
+                "Scanning loop active.")
+        st.markdown("---")
+        return
+
+    returns = [
+        float(p["price_target_delta_pct"]) for p in picks
+        if isinstance(p.get("price_target_delta_pct"), (int, float))
+    ]
+    with_targets = sum(1 for p in picks if _fmt_num(p.get("implied_price_target")))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Top picks", len(picks))
+    m2.metric("Avg expected return",
+              f"{sum(returns) / len(returns):+.1f}%" if returns else "—")
+    m3.metric("Best upside", f"{max(returns):+.1f}%" if returns else "—")
+    m4.metric("With price target", f"{with_targets}/{len(picks)}")
+
+    st.markdown("")
+    for p in picks:
+        company = p.get("company", "—")
+        domain = str(p.get("domain") or "").strip()
+        headline = p.get("headline", "")
+        rec = str(p.get("recommendation") or "").strip()
+        driver = str(p.get("supply_chain_driver") or "").strip() or "—"
+        score = int(p.get("conviction_score", 0) or 0)
+        delta_str = _fmt_num(p.get("price_target_delta_pct"), suffix="%", signed=True)
+        target_str = _fmt_num(p.get("implied_price_target"), prefix="$")
+
+        with st.container(border=True):
+            head, c_ret, c_pt = st.columns([4, 1.4, 1.4])
+            with head:
+                st.markdown(f"**{company}**" + (f"  ·  {domain}" if domain else ""))
+                st.markdown(f"##### {headline}")
+                tags = [f"⚙ {driver}"]
+                if rec:
+                    tags.append(f"**{rec}**")
+                if score:
+                    tags.append(f"Conviction {score}/10")
+                st.caption("  ·  ".join(tags))
+            c_ret.metric("Expected return", delta_str or "—")
+            c_pt.metric("12M price target", target_str or "n/a")
+
+            with st.expander("Financial impact brief"):
+                thesis = str(p.get("financial_impact_thesis") or "").strip()
+                analysis = str(p.get("analysis") or "").strip()
+                if thesis:
+                    st.markdown(f"**Supply / earnings impact** — {thesis}")
+                if analysis:
+                    st.markdown(f"**Analyst view** — {analysis}")
+                if not (thesis or analysis):
+                    st.caption("No written brief was captured for this signal.")
+                meta = _fmt_date(p.get("created_at"))
+                capex = _fmt_num(p.get("cited_capex_usd_m"), prefix="$", suffix="M")
+                if capex:
+                    meta += f"  ·  cited capex {capex}"
+                st.caption(meta)
+                url = p.get("url")
+                if url:
+                    st.link_button("↗ Open source", url)
+    st.markdown("---")
+
+
 # ---------------------------------------------------------------- header
 st.markdown('<div class="terminal-title">Market Intelligence Terminal</div>', unsafe_allow_html=True)
 st.markdown(
@@ -364,61 +443,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------------------------------------------------------- Executive Top Picks Hero Section
-top_picks = [
-    s for s in signals 
-    if "BUY" in str(s.get("recommendation", "")).upper() 
-    and int(s.get("conviction_score", 0)) >= 8
-]
-
-# Rank top picks by price target delta percentage (descending)
-top_picks.sort(
-    key=lambda x: float(x.get("price_target_delta_pct") or 0.0), 
-    reverse=True
-)
-
-if top_picks:
-    st.markdown("### 🎯 EXECUTIVE TOP PICKS")
-    st.caption("Highest-conviction strategic buy opportunities ranked by target upside & physical supply catalysts.")
-    
-    for pick in top_picks[:5]:
-        company = html.escape(str(pick.get("company", "—")))
-        headline = html.escape(str(pick.get("headline", "")))
-        rec = str(pick.get("recommendation", "HIGH CONVICTION BUY")).strip()
-        driver = str(pick.get("supply_chain_driver", "CapEx Expansion")).strip()
-        thesis = pick.get("financial_impact_thesis") or "No detailed financial bridge provided."
-        url = pick.get("url") or ""
-        score = pick.get("conviction_score", 8)
-        
-        delta = _fmt_num(pick.get("price_target_delta_pct"), suffix="%", signed=True)
-        target = _fmt_num(pick.get("implied_price_target"), prefix="$")
-        
-        with st.container(border=True):
-            col_ticker, col_driver, col_return, col_target = st.columns([2.2, 2, 1.4, 1.4])
-            
-            with col_ticker:
-                st.markdown(f"### **{company}**")
-                st.caption(f"Score: `{score}/10`  |  `{rec}`")
-            
-            with col_driver:
-                st.markdown("**Supply Driver**")
-                st.caption(f"`{driver}`")
-            
-            with col_return:
-                st.metric("Expected Upside", delta if delta else "N/A")
-            
-            with col_target:
-                st.metric("Price Target", target if target else "N/A")
-            
-            st.markdown(f"**Catalyst:** {headline}")
-            
-            with st.expander("🔍 Institutional Rationale & Thesis"):
-                st.markdown("#### **Financial Impact Thesis**")
-                st.info(thesis)
-                if url:
-                    st.markdown(f"[📄 **View Primary Source Article**]({url})")
-                    
-    st.markdown("---")
+# ---------------------------------------------------------------- Executive Top Picks
+render_top_picks(load_top_picks(6))
 
 # ---------------------------------------------------------------- Main Feed
 st.markdown("### 📡 ALL LIVE SIGNALS")
