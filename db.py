@@ -31,7 +31,8 @@ Supabase SQL editor; the outline below is kept in sync for reference):
         company_symbol    text,
         company_name      text,
         domain            text,
-        raw_items_count   int  not null default 0,
+        raw_collected     int  not null default 0,  -- items found before dedup
+        raw_items_count   int  not null default 0,  -- items actually graded
         signals_found     int  not null default 0,
         scanned_at        timestamptz not null default now()
     );
@@ -332,12 +333,20 @@ def log_scan(
     domain: str,
     raw_items_count: int,
     signals_found: int,
+    raw_collected: int | None = None,
 ) -> None:
-    """Record one company's scan outcome in the 'scan_logs' audit table."""
+    """
+    Record one company's scan outcome in the 'scan_logs' audit table.
+
+    ``raw_collected`` is the item count found before URL de-duplication;
+    ``raw_items_count`` is what was actually sent to Gemini. The gap between
+    them is the quota saved by the seen_urls filter.
+    """
     row = {
         "company_symbol": company_symbol,
         "company_name": company_name,
         "domain": domain,
+        "raw_collected": int(raw_collected if raw_collected is not None else raw_items_count),
         "raw_items_count": int(raw_items_count),
         "signals_found": int(signals_found),
         "scanned_at": _utcnow_iso(),
@@ -346,7 +355,8 @@ def log_scan(
         _supabase.table("scan_logs").insert(row).execute()
         print(
             f"[db] scan_logs += {company_symbol} "
-            f"(raw={raw_items_count}, signals={signals_found})"
+            f"(collected={row['raw_collected']}, graded={raw_items_count}, "
+            f"signals={signals_found})"
         )
     except Exception as exc:  # never let audit logging break a scan
         print(f"[db] WARNING: could not write scan_logs for {company_symbol}: {exc}")
@@ -390,7 +400,7 @@ def fetch_scan_logs(limit: int = 50) -> list[dict[str, Any]]:
     resp = (
         _supabase.table("scan_logs")
         .select("scanned_at, company_symbol, company_name, domain, "
-                "raw_items_count, signals_found")
+                "raw_collected, raw_items_count, signals_found")
         .order("scanned_at", desc=True)
         .limit(limit)
         .execute()

@@ -1,4 +1,6 @@
-google-genai>=0.3.0
+# google-genai 2.x uses header auth (x-goog-api-key) and accepts the current
+# 'AQ.'-prefixed Gemini API keys; older releases predate that key format.
+google-genai>=2.14.0
 supabase>=2.4.0
 requests>=2.31.0
 feedparser>=6.0.11

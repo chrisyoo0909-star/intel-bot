@@ -7,11 +7,18 @@ All sources are public RSS/Atom feeds. No API keys required.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote_plus
 
 import feedparser
 import requests
+
+
+class ScrapeResult(NamedTuple):
+    """Outcome of scraping one company."""
+
+    items: list[dict[str, Any]]  # items to grade (post seen-URL filter)
+    collected: int               # unique items found before the seen-URL filter
 
 # SEC requires a descriptive User-Agent with contact info on every request.
 SEC_USER_AGENT = "ResearchBot admin@investor.com"
@@ -127,7 +134,7 @@ def fetch_google_news(company_name: str, max_items: int = 12) -> list[dict[str, 
 
 def gather_raw_items(
     ticker: str, company_name: str, skip_seen: bool = True
-) -> list[dict[str, Any]]:
+) -> ScrapeResult:
     """
     Aggregate SEC + Google News raw text items for one company.
 
@@ -137,6 +144,9 @@ def gather_raw_items(
     table are dropped so they are never sent through Gemini a second time. If the
     db layer is unavailable (e.g. running the scraper standalone) the filter is
     silently skipped.
+
+    Returns a ScrapeResult(items, collected) where ``collected`` is the unique
+    item count before the seen-URL filter — recorded for quota-savings auditing.
     """
     items: list[dict[str, Any]] = []
     items.extend(fetch_sec_filings(ticker))
@@ -166,4 +176,4 @@ def gather_raw_items(
         f"[scraper] {company_name} ({ticker}): "
         f"{collected} collected, {len(deduped)} new to grade."
     )
-    return deduped
+    return ScrapeResult(items=deduped, collected=collected)

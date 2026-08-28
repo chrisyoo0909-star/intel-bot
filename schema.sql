@@ -40,10 +40,13 @@ create table if not exists scan_logs (
     company_symbol    text,
     company_name      text,
     domain            text,
-    raw_items_count   int  not null default 0,
+    raw_collected     int  not null default 0,  -- items found before URL dedup
+    raw_items_count   int  not null default 0,  -- items actually sent to Gemini
     signals_found     int  not null default 0,
     scanned_at        timestamptz not null default now()
 );
+-- Backfill for tables created before raw_collected existed.
+alter table scan_logs add column if not exists raw_collected int not null default 0;
 create index if not exists scan_logs_scanned_at_idx
     on scan_logs (scanned_at desc);
 

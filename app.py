@@ -325,7 +325,8 @@ with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded
                 "Symbol": row.get("company_symbol") or "—",
                 "Company": row.get("company_name") or "—",
                 "Domain": row.get("domain") or "—",
-                "Raw Items": int(row.get("raw_items_count") or 0),
+                "Collected": int(row.get("raw_collected") or 0),
+                "Graded": int(row.get("raw_items_count") or 0),
                 "Signals Saved": int(row.get("signals_found") or 0),
             }
             for row in logs
@@ -335,13 +336,23 @@ with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Raw Items": st.column_config.NumberColumn(format="%d"),
+                "Collected": st.column_config.NumberColumn(
+                    format="%d", help="Items found before URL de-duplication"
+                ),
+                "Graded": st.column_config.NumberColumn(
+                    format="%d", help="New items actually sent to Gemini"
+                ),
                 "Signals Saved": st.column_config.NumberColumn(format="%d"),
             },
         )
-        total_raw = sum(r["Raw Items"] for r in table)
+        total_collected = sum(r["Collected"] for r in table)
+        total_graded = sum(r["Graded"] for r in table)
         total_sig = sum(r["Signals Saved"] for r in table)
+        saved_pct = (
+            1 - total_graded / total_collected if total_collected else 0.0
+        )
         st.caption(
-            f"{len(table)} scans shown · {total_raw} raw items processed · "
-            f"{total_sig} signals saved"
+            f"{len(table)} scans shown · {total_collected} collected · "
+            f"{total_graded} graded · {total_sig} signals · "
+            f"{saved_pct:.0%} of Gemini calls saved by URL dedup"
         )

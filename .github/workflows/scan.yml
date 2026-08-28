@@ -2,7 +2,8 @@ name: Autonomous Market Scanner
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    # Every 6 hours — keeps total Gemini calls within the free-tier daily budget.
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
