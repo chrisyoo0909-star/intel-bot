@@ -27,7 +27,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip("'").strip('
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY must be set in the local .env file.")
 
-MODEL = "gemini-2.5-flash"
+# Pinned Flash model. Google retired gemini-2.5-flash for new API keys;
+# swap to "gemini-flash-latest" if you'd rather auto-track the newest Flash.
+MODEL = "gemini-3.6-flash"
 _REST_ENDPOINT = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 )
