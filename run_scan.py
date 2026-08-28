@@ -22,7 +22,9 @@ from analyzer import evaluate_item
 from db import (
     get_next_company_batch,
     log_scan,
+    mark_items_seen,
     prune_scan_logs,
+    prune_seen_urls,
     save_signal,
     seed_company_queue,
     update_scan_timestamp,
@@ -79,6 +81,7 @@ def scan() -> None:
 
         raw_items = raw_items[:MAX_ITEMS_PER_COMPANY]
         company_signals = 0
+        graded_items: list[dict] = []
 
         for j, item in enumerate(raw_items, start=1):
             total_items += 1
@@ -86,6 +89,10 @@ def scan() -> None:
             url = item.get("url", "")
 
             verdict = evaluate_item(name, domain, snippet, url)
+            # Only fingerprint items Gemini actually judged; a transient API
+            # error leaves the URL unseen so the next run retries it.
+            if "error" not in verdict:
+                graded_items.append(item)
             score = verdict["conviction_score"]
             flag = "SIGNAL" if verdict["valid"] else "filler"
             print(
@@ -116,6 +123,9 @@ def scan() -> None:
             # Gentle pacing for the free Gemini tier.
             time.sleep(1.0)
 
+        # Fingerprint every graded URL so it is never re-sent to Gemini.
+        mark_items_seen(graded_items, company_symbol=ticker)
+
         # Audit-log this company's outcome immediately after it finishes.
         log_scan(
             company_symbol=ticker,
@@ -130,6 +140,7 @@ def scan() -> None:
 
     update_scan_timestamp(processed_ids)
     prune_scan_logs()
+    prune_seen_urls()
 
     _rule("=")
     print("SCAN COMPLETE")

@@ -125,17 +125,24 @@ def fetch_google_news(company_name: str, max_items: int = 12) -> list[dict[str, 
     return items
 
 
-def gather_raw_items(ticker: str, company_name: str) -> list[dict[str, Any]]:
+def gather_raw_items(
+    ticker: str, company_name: str, skip_seen: bool = True
+) -> list[dict[str, Any]]:
     """
     Aggregate SEC + Google News raw text items for one company.
 
     Each item: {title, summary, url, source}.
+
+    When ``skip_seen`` is True, URLs already recorded in Supabase's 'seen_urls'
+    table are dropped so they are never sent through Gemini a second time. If the
+    db layer is unavailable (e.g. running the scraper standalone) the filter is
+    silently skipped.
     """
     items: list[dict[str, Any]] = []
     items.extend(fetch_sec_filings(ticker))
     items.extend(fetch_google_news(company_name))
 
-    # De-duplicate on URL while preserving order.
+    # De-duplicate on URL within this batch while preserving order.
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for item in items:
@@ -145,8 +152,18 @@ def gather_raw_items(ticker: str, company_name: str) -> list[dict[str, Any]]:
         seen.add(key)
         deduped.append(item)
 
+    collected = len(deduped)
+
+    if skip_seen:
+        try:
+            from db import filter_unseen_items
+
+            deduped = filter_unseen_items(deduped)
+        except Exception as exc:  # ImportError, missing creds, network, ...
+            print(f"[scraper] seen-URL filter unavailable ({exc}); grading all.")
+
     print(
         f"[scraper] {company_name} ({ticker}): "
-        f"{len(deduped)} raw items collected."
+        f"{collected} collected, {len(deduped)} new to grade."
     )
     return deduped

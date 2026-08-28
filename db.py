@@ -1,7 +1,8 @@
 """
 Supabase persistence layer for the market intelligence pipeline.
 
-Expected Supabase schema (run once in the Supabase SQL editor):
+Expected Supabase schema (canonical copy lives in schema.sql — run that in the
+Supabase SQL editor; the outline below is kept in sync for reference):
 
     create table if not exists company_queue (
         id            bigint generated always as identity primary key,
@@ -21,6 +22,9 @@ Expected Supabase schema (run once in the Supabase SQL editor):
         url               text,
         created_at        timestamptz not null default now()
     );
+    -- Prevent duplicate high-conviction entries for the same story.
+    alter table signals
+        add constraint signals_company_headline_key unique (company, headline);
 
     create table if not exists scan_logs (
         id                uuid primary key default gen_random_uuid(),
@@ -34,15 +38,27 @@ Expected Supabase schema (run once in the Supabase SQL editor):
     create index if not exists scan_logs_scanned_at_idx
         on scan_logs (scanned_at desc);
 
+    -- Fingerprints of every article/filing already graded, so the scraper
+    -- never sends the same URL through Gemini twice.
+    create table if not exists seen_urls (
+        url_hash        text primary key,
+        url             text,
+        company_symbol  text,
+        first_seen_at   timestamptz not null default now()
+    );
+    create index if not exists seen_urls_first_seen_at_idx
+        on seen_urls (first_seen_at desc);
+
 Credentials are read strictly from the local .env file.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -162,6 +178,29 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _chunks(seq: list[Any], size: int) -> Iterable[list[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def normalize_url(url: str) -> str:
+    """Canonicalize a URL for stable de-duplication."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    parts = urlsplit(raw)
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/") or "/"
+    # Canonicalize scheme to https and drop query/fragment: news aggregators
+    # serve the same article under http/https and with volatile tracking params.
+    return urlunsplit(("https", netloc, path, "", ""))
+
+
+def url_hash(url: str) -> str:
+    """SHA-256 fingerprint of the normalized URL."""
+    return hashlib.sha256(normalize_url(url).encode("utf-8")).hexdigest()
+
+
 def seed_company_queue() -> int:
     """
     Seed 'company_queue' with the target universe if the table is empty.
@@ -239,7 +278,13 @@ def save_signal(
     """
     Persist a high-conviction signal (score >= 8) into the 'signals' table.
 
-    Returns True when a row was written, False when the score was below threshold.
+    Upserts on the (company, headline) unique constraint so re-encountering the
+    same story refreshes its score/analysis instead of creating a duplicate.
+    'created_at' is intentionally omitted so the original first-seen timestamp
+    (column default) is preserved on conflict updates.
+
+    Returns True when a row was written/updated, False when the score was below
+    threshold.
     """
     if score < 8:
         return False
@@ -250,9 +295,12 @@ def save_signal(
         "headline": headline,
         "analysis": analysis,
         "url": url,
-        "created_at": _utcnow_iso(),
     }
-    _supabase.table("signals").insert(row).execute()
+    (
+        _supabase.table("signals")
+        .upsert(row, on_conflict="company,headline")
+        .execute()
+    )
     print(f"[db] Saved signal [{score}/10] {company}: {headline}")
     return True
 
@@ -348,3 +396,100 @@ def fetch_scan_logs(limit: int = 50) -> list[dict[str, Any]]:
         .execute()
     )
     return resp.data or []
+
+
+# ------------------------------------------------------------------ seen_urls
+
+SEEN_URL_RETENTION_DAYS = 120  # forget fingerprints older than this
+
+
+def filter_unseen_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Return only the raw items whose URL has never been graded before.
+
+    Items without a URL are always kept (they cannot be de-duplicated).
+    On any Supabase error the full list is returned unchanged so a transient
+    outage never silently drops coverage.
+    """
+    if not items:
+        return items
+
+    hashed = [(it, url_hash(it["url"])) for it in items if it.get("url")]
+    unique_hashes = sorted({h for _, h in hashed})
+    if not unique_hashes:
+        return items
+
+    seen: set[str] = set()
+    try:
+        for chunk in _chunks(unique_hashes, 100):
+            resp = (
+                _supabase.table("seen_urls")
+                .select("url_hash")
+                .in_("url_hash", chunk)
+                .execute()
+            )
+            seen.update(r["url_hash"] for r in (resp.data or []))
+    except Exception as exc:
+        print(f"[db] WARNING: seen_urls lookup failed, grading all items: {exc}")
+        return items
+
+    kept: list[dict[str, Any]] = []
+    skipped = 0
+    for it in items:
+        u = it.get("url")
+        if u and url_hash(u) in seen:
+            skipped += 1
+            continue
+        kept.append(it)
+
+    if skipped:
+        print(f"[db] Skipped {skipped} already-seen item(s); {len(kept)} new.")
+    return kept
+
+
+def mark_items_seen(
+    items: list[dict[str, Any]], company_symbol: str | None = None
+) -> None:
+    """Record the URLs of items that have now been graded."""
+    rows: dict[str, dict[str, Any]] = {}
+    for it in items:
+        u = it.get("url")
+        if not u:
+            continue
+        h = url_hash(u)
+        rows[h] = {
+            "url_hash": h,
+            "url": normalize_url(u),
+            "company_symbol": company_symbol,
+        }
+    if not rows:
+        return
+    try:
+        for chunk in _chunks(list(rows.values()), 200):
+            (
+                _supabase.table("seen_urls")
+                .upsert(chunk, on_conflict="url_hash", ignore_duplicates=True)
+                .execute()
+            )
+        print(f"[db] Recorded {len(rows)} URL fingerprint(s) in seen_urls.")
+    except Exception as exc:
+        print(f"[db] WARNING: could not update seen_urls: {exc}")
+
+
+def prune_seen_urls(days: int = SEEN_URL_RETENTION_DAYS) -> int:
+    """Delete URL fingerprints older than ``days`` to keep the table bounded."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        deleted = (
+            _supabase.table("seen_urls")
+            .delete()
+            .lt("first_seen_at", cutoff)
+            .execute()
+        )
+        n = len(deleted.data or [])
+        if n:
+            print(f"[db] Pruned {n} seen_urls rows older than {days}d.")
+        return n
+    except Exception as exc:
+        print(f"[db] WARNING: seen_urls prune skipped: {exc}")
+        return 0
