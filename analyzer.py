@@ -8,7 +8,7 @@ Configure via the local .env:
 
     LLM_API_KEY   = <key>                          # or GROQ_API_KEY
     LLM_BASE_URL  = https://api.groq.com/openai/v1  # optional override
-    LLM_MODEL     = llama-3.3-70b-versatile         # optional override
+    LLM_MODEL     = openai/gpt-oss-120b             # optional override
 
 Other zero-cost backends that work by changing only those three vars:
     OpenRouter free tier -> https://openrouter.ai/api/v1   + a ":free" model id
@@ -41,7 +41,7 @@ if not LLM_API_KEY:
     )
 
 LLM_BASE_URL = (_clean(os.environ.get("LLM_BASE_URL")) or "https://api.groq.com/openai/v1").rstrip("/")
-LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "llama-3.3-70b-versatile"
+LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "openai/gpt-oss-120b"
 _ENDPOINT = f"{LLM_BASE_URL}/chat/completions"
 _TIMEOUT = 45
 _MAX_RETRY_AFTER = 20  # seconds; longer waits are treated as daily exhaustion
