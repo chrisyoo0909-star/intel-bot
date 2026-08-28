@@ -13,14 +13,19 @@ Supabase SQL editor; the outline below is kept in sync for reference):
     );
 
     create table if not exists signals (
-        id                bigint generated always as identity primary key,
-        company           text not null,
-        domain            text not null,
-        conviction_score  int  not null,
-        headline          text not null,
-        analysis          text not null,
-        url               text,
-        created_at        timestamptz not null default now()
+        id                       bigint generated always as identity primary key,
+        company                  text not null,
+        domain                   text not null,
+        conviction_score         int  not null,
+        headline                 text not null,
+        analysis                 text not null,
+        url                      text,
+        recommendation           text,
+        price_target_delta_pct   numeric,
+        implied_price_target     numeric,
+        supply_chain_driver      text,
+        financial_impact_thesis  text,
+        created_at               timestamptz not null default now()
     );
     -- Prevent duplicate high-conviction entries for the same story.
     alter table signals
@@ -65,6 +70,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -276,6 +282,27 @@ def update_scan_timestamp(company_ids: Iterable[int]) -> None:
     print(f"[db] Updated last_scanned for {len(ids)} companies.")
 
 
+def _to_number(value: Any) -> float | None:
+    """Best-effort numeric coercion; returns None for anything unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    else:
+        text = str(value).strip().replace("%", "").replace("$", "").replace(",", "")
+        text = text.lstrip("+")
+        m = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not m:
+            return None
+        try:
+            num = float(m.group(0))
+        except ValueError:
+            return None
+    if num != num or num in (float("inf"), float("-inf")):
+        return None
+    return round(num, 4)
+
+
 def save_signal(
     company: str,
     domain: str,
@@ -283,17 +310,23 @@ def save_signal(
     headline: str,
     analysis: str,
     url: str | None,
+    recommendation: str | None = None,
+    supply_chain_driver: str | None = None,
+    price_target_delta_pct: Any = None,
+    implied_price_target: Any = None,
+    financial_impact_thesis: str | None = None,
 ) -> bool:
     """
     Persist a high-conviction signal (score >= 8) into the 'signals' table.
 
     Upserts on the (company, headline) unique constraint so re-encountering the
-    same story refreshes its score/analysis instead of creating a duplicate.
-    'created_at' is intentionally omitted so the original first-seen timestamp
-    (column default) is preserved on conflict updates.
+    same story refreshes its fields instead of creating a duplicate. 'created_at'
+    is omitted so the original first-seen timestamp is preserved on updates.
 
-    Returns True when a row was written/updated, False when the score was below
-    threshold.
+    Numeric fields (price_target_delta_pct, implied_price_target) are coerced
+    with a graceful fallback to NULL — a bad model value never breaks the write.
+
+    Returns True when a row was written/updated, False when score < 8.
     """
     if score < 8:
         return False
@@ -304,13 +337,34 @@ def save_signal(
         "headline": headline,
         "analysis": analysis,
         "url": url,
+        "recommendation": (recommendation or None),
+        "supply_chain_driver": (supply_chain_driver or None),
+        "price_target_delta_pct": _to_number(price_target_delta_pct),
+        "implied_price_target": _to_number(implied_price_target),
+        "financial_impact_thesis": (financial_impact_thesis or None),
     }
-    (
-        _supabase.table("signals")
-        .upsert(row, on_conflict="company,headline")
-        .execute()
-    )
-    print(f"[db] Saved signal [{score}/10] {company}: {headline}")
+    try:
+        _supabase.table("signals").upsert(row, on_conflict="company,headline").execute()
+    except Exception as exc:
+        # Older 'signals' table without the analyst columns -> retry with the
+        # core fields only so the signal is still captured.
+        if "column" in str(exc).lower() or "schema cache" in str(exc).lower():
+            core = {k: row[k] for k in (
+                "company", "domain", "conviction_score", "headline", "analysis", "url"
+            )}
+            _supabase.table("signals").upsert(core, on_conflict="company,headline").execute()
+            print(f"[db] Saved signal (core fields only — run schema.sql) "
+                  f"[{score}/10] {company}: {headline}")
+            return True
+        raise
+    tgt = row["implied_price_target"]
+    dlt = row["price_target_delta_pct"]
+    extra = f" | {row['recommendation']}"
+    if dlt is not None:
+        extra += f" {dlt:+.1f}%"
+    if tgt is not None:
+        extra += f" -> {tgt}"
+    print(f"[db] Saved signal [{score}/10] {company}: {headline}{extra}")
     return True
 
 

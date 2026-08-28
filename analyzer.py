@@ -8,8 +8,11 @@ Configure via the local .env:
 
     LLM_API_KEY          = <key>                          # or GROQ_API_KEY
     LLM_BASE_URL         = https://api.groq.com/openai/v1  # optional override
-    LLM_MODEL            = openai/gpt-oss-20b              # optional override
-    LLM_REASONING_EFFORT = low                            # low|medium|high; "off" omits it
+    LLM_MODEL            = qwen/qwen3.8-27b                # optional override
+    LLM_REASONING_EFFORT = none                           # none|low|medium|high; "off" omits it
+
+qwen3.8-27b with reasoning disabled is ~600 tokens/call and fits Groq's free
+8k TPM budget. groq/compound-mini has a 70k TPM budget if you need headroom.
 
 Other zero-cost backends that work by changing only those vars:
     OpenRouter free tier -> https://openrouter.ai/api/v1   + a ":free" model id
@@ -43,20 +46,20 @@ if not LLM_API_KEY:
     )
 
 LLM_BASE_URL = (_clean(os.environ.get("LLM_BASE_URL")) or "https://api.groq.com/openai/v1").rstrip("/")
-LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "openai/gpt-oss-20b"
+LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "qwen/qwen3.8-27b"
 
-# Reasoning models (gpt-oss, qwen3) otherwise emit thousands of hidden tokens
-# per call and blow small free-tier per-minute token budgets. "low" keeps
-# grading quality while cutting usage ~15x. Any non-empty value is sent as-is;
-# the special value "off" omits the field for backends that reject it.
-_re_env = _clean(os.environ.get("LLM_REASONING_EFFORT")) or "low"
+# Reasoning models otherwise emit thousands of hidden tokens per call and blow
+# small free-tier per-minute token budgets. "none" disables it (qwen3); use
+# "low" for gpt-oss. Any non-empty value is sent as-is; "off" omits the field
+# for backends that reject it.
+_re_env = _clean(os.environ.get("LLM_REASONING_EFFORT")) or "none"
 LLM_REASONING_EFFORT = "" if _re_env.lower() == "off" else _re_env
 
 _ENDPOINT = f"{LLM_BASE_URL}/chat/completions"
-_TIMEOUT = 45
+_TIMEOUT = 60
 _MAX_RETRY_AFTER = 30  # seconds; longer waits are treated as daily exhaustion
-_MAX_ATTEMPTS = 3
-_SNIPPET_CHARS = 3500
+_MAX_ATTEMPTS = 4
+_SNIPPET_CHARS = 2600
 
 
 class LLMQuotaError(RuntimeError):
@@ -68,43 +71,96 @@ class _AuthError(RuntimeError):
 
 
 _SYSTEM_INSTRUCTION = (
-    "You are a Senior Wall Street Infrastructure Analyst. You evaluate news "
-    "articles and regulatory filings for strategic leverage shifts, hard "
-    "physical CapEx commitments, and supply-chain chokepoints across advanced "
-    "compute, hyperscale cloud, critical energy, critical minerals, and "
-    "physical AI / robotics.\n\n"
-    "The RAW ITEM is usually the full article or filing body. Judge it on what "
-    "the text actually substantiates — specific dollar amounts, capacity "
-    "figures (GW, tons, wafers), facilities, counterparties, timelines.\n\n"
-    "Grade strictly from 1 to 10 on 'conviction_score':\n"
-    "  1-4  = noise: opinion/analysis columns, price-target or rating changes, "
-    "stock-move recaps, 'could'/'may'/rumor pieces, listicles, PR with no "
-    "specifics, or a headline with no supporting body.\n"
-    "  5-7  = relevant and real but not decision-grade (incremental update, "
-    "vague guidance, small or unquantified spend).\n"
-    "  8    = a concrete, material, already-committed infrastructure or "
-    "supply-chain development specific to THIS company.\n"
-    "  9-10 = a decisive strategic shift with a quantified capital or capacity "
-    "commitment and named assets/counterparties.\n\n"
-    "Rules: If the item is primarily about a different company, cap at 5. If it "
-    "is speculation, sentiment, or lacks a concrete physical/capital fact, it "
-    "MUST score below 8. Do not inflate scores for strong headlines alone.\n\n"
-    "Respond with ONLY a JSON object with exactly these keys: "
-    "\"conviction_score\" (integer 1-10), \"headline\" (a crisp Bloomberg/Reuters-"
-    "style headline string grounded in the text), \"analysis\" (a concise "
-    "two-sentence Wall Street commentary string)."
+    "You are a Senior Supply-Chain Equity Analyst on a Wall Street "
+    "infrastructure desk. You read full news articles and regulatory filings "
+    "and isolate SUPPLY-SIDE catalysts: capacity additions, lead-time shifts, "
+    "physical CapEx deployments, long-term off-take / take-or-pay agreements, "
+    "power PPAs, and manufacturing bottlenecks — across advanced compute, "
+    "hyperscale cloud, critical energy, critical minerals, and physical AI / "
+    "robotics.\n\n"
+    "METHOD:\n"
+    "1. Judge the article ONLY on what its text substantiates — specific dollar "
+    "amounts, capacity figures (GW, tons, wafers, units), named facilities, "
+    "counterparties, and timelines. A strong headline with no supporting body "
+    "is noise.\n"
+    "2. Project the estimated financial impact: shift in revenue growth rate, "
+    "gross/EBITDA margin expansion in basis points, and/or backlog growth.\n"
+    "3. Derive a 12-month price-target delta as a percent, from plausible "
+    "EV/EBITDA or P/E multiple change plus the earnings impact. If a current "
+    "share price appears in the text, also compute implied_price_target = "
+    "current_price * (1 + price_target_delta_pct/100); otherwise set it null.\n\n"
+    "conviction_score (1-10), strict:\n"
+    "  1-4  = noise: opinion/analysis columns, analyst price-target or rating "
+    "changes, stock-move recaps, rumor/'could'/'may' pieces, listicles, "
+    "specifics-free PR.\n"
+    "  5-7  = a real but not decision-grade supply development (incremental, "
+    "vague, small or unquantified).\n"
+    "  8    = a concrete, committed capacity / supply-chain catalyst specific "
+    "to THIS company.\n"
+    "  9-10 = a decisive supply-side shift with quantified capital or capacity "
+    "and named assets / counterparties.\n"
+    "If the article is primarily about a different company, cap at 5. "
+    "Speculation or no concrete physical/capital fact => below 8.\n\n"
+    "recommendation must be one of: \"HIGH CONVICTION BUY\", \"BUY\", "
+    "\"NEUTRAL / WATCH\", \"AVOID\".\n"
+    "supply_chain_driver: a short phrase, ideally one of \"CapEx Expansion\", "
+    "\"Bottleneck Relief\", \"Power PPA\", \"Raw Material Off-take\", "
+    "\"Capacity Addition\", \"Lead-Time Shift\" (or a close variant).\n\n"
+    "Respond with ONLY a JSON object with EXACTLY these keys:\n"
+    "{\n"
+    '  "conviction_score": int 1-10,\n'
+    '  "recommendation": string,\n'
+    '  "headline": string,  // crisp Bloomberg/Reuters style, grounded in the text\n'
+    '  "supply_chain_driver": string,\n'
+    '  "price_target_delta_pct": number,  // signed percent, e.g. 12.5 or -4.0\n'
+    '  "implied_price_target": number or null,\n'
+    '  "analysis": string,  // two concise sentences of Wall Street commentary\n'
+    '  "financial_impact_thesis": string  // revenue / EBITDA margin / backlog breakdown\n'
+    "}"
 )
 
 
 def _fallback(reason: str, kind: str = "other") -> dict[str, Any]:
     return {
         "conviction_score": 1,
+        "recommendation": "AVOID",
         "headline": "",
+        "supply_chain_driver": "",
+        "price_target_delta_pct": None,
+        "implied_price_target": None,
         "analysis": "",
+        "financial_impact_thesis": "",
         "valid": False,
         "error": reason,
         "error_kind": kind,  # auth | quota | parse | network | other
     }
+
+
+_RECOMMENDATIONS = {
+    "HIGH CONVICTION BUY", "BUY", "NEUTRAL / WATCH", "AVOID",
+}
+
+
+def _num(value: Any) -> float | None:
+    """Coerce an LLM-supplied number to float, or None if it isn't usable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if _finite(float(value)) else None
+    text = str(value).strip().replace("%", "").replace("$", "").replace(",", "")
+    text = text.lstrip("+")
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        num = float(m.group(0))
+    except ValueError:
+        return None
+    return num if _finite(num) else None
+
+
+def _finite(x: float) -> bool:
+    return x == x and x not in (float("inf"), float("-inf"))
 
 
 def _looks_like_quota(text: str) -> bool:
@@ -187,7 +243,7 @@ def _chat(prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 500,
+        "max_tokens": 900,
         "response_format": {"type": "json_object"},
     }
     if LLM_REASONING_EFFORT:
@@ -235,19 +291,41 @@ def _parse_verdict(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         return _fallback(f"non-object response: {raw[:200]}", kind="parse")
 
-    try:
-        score = int(data.get("conviction_score", 0))
-    except (TypeError, ValueError):
-        score = 0
+    def _text(key: str) -> str:
+        val = str(data.get(key, "") or "").strip()
+        return "" if val.lower() in ("none", "null", "n/a", "na", "-") else val
+
+    score_num = _num(data.get("conviction_score"))
+    score = int(round(score_num)) if score_num is not None else 0
     score = max(1, min(10, score))
 
-    headline = str(data.get("headline", "")).strip()
-    analysis = str(data.get("analysis", "")).strip()
+    headline = _text("headline")
+    analysis = _text("analysis")
+    thesis = _text("financial_impact_thesis")
+    driver = _text("supply_chain_driver")
+
+    rec = str(data.get("recommendation", "")).strip().upper()
+    if rec not in _RECOMMENDATIONS:
+        rec = "HIGH CONVICTION BUY" if score >= 9 else (
+            "BUY" if score >= 8 else "NEUTRAL / WATCH" if score >= 5 else "AVOID"
+        )
+
+    delta = _num(data.get("price_target_delta_pct"))
+    if delta is not None and abs(delta) > 200:  # implausible model output
+        delta = None
+    target = _num(data.get("implied_price_target"))
+    if target is not None and target <= 0:
+        target = None
 
     return {
         "conviction_score": score,
+        "recommendation": rec,
         "headline": headline,
+        "supply_chain_driver": driver,
+        "price_target_delta_pct": delta,
+        "implied_price_target": target,
         "analysis": analysis,
+        "financial_impact_thesis": thesis,
         "valid": score >= 8 and bool(headline) and bool(analysis),
     }
 
@@ -257,13 +335,16 @@ def evaluate_item(
     domain: str,
     text_snippet: str,
     source_url: str,
+    ticker: str | None = None,
 ) -> dict[str, Any]:
     """
     Grade a single raw item with the configured LLM.
 
-    Returns a dict with 'conviction_score' (1-10), 'headline', 'analysis', and
-    'valid' (True only when score >= 8). On a handled failure the same shape is
-    returned with 'error' and 'error_kind' set and 'valid' False.
+    Returns a dict with 'conviction_score' (1-10), 'recommendation', 'headline',
+    'supply_chain_driver', 'price_target_delta_pct' (float|None),
+    'implied_price_target' (float|None), 'analysis', 'financial_impact_thesis',
+    and 'valid' (True only when score >= 8). On a handled failure the same shape
+    is returned with 'error'/'error_kind' set and 'valid' False.
 
     Raises:
         LLMQuotaError: when the API quota/rate limit is exhausted, so the caller
@@ -275,10 +356,11 @@ def evaluate_item(
 
     prompt = (
         f"COMPANY: {company_name}\n"
+        f"TICKER: {ticker or 'n/a'}\n"
         f"DOMAIN: {domain}\n"
         f"SOURCE URL: {source_url}\n"
-        f"RAW ITEM:\n\"\"\"\n{snippet[:_SNIPPET_CHARS]}\n\"\"\"\n\n"
-        "Evaluate this item now and return the JSON object."
+        f"ARTICLE / FILING TEXT:\n\"\"\"\n{snippet[:_SNIPPET_CHARS]}\n\"\"\"\n\n"
+        "Analyze the supply-side catalyst and return the JSON object."
     )
 
     try:

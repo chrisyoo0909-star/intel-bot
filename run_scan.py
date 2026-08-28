@@ -40,9 +40,10 @@ from db import (
 from scraper import gather_raw_items
 
 BATCH_SIZE = 10
-MAX_ITEMS_PER_COMPANY = 8       # cap LLM calls per company (free-tier budget)
+MAX_ITEMS_PER_COMPANY = 6       # cap LLM calls per company (free-tier budget)
 LLM_FAILURE_ABORT_RATIO = 0.5   # fail the run if this share of calls error out
-ITEM_PACING_SECONDS = 4.0       # ~15 calls/min: within Groq free-tier 8k TPM
+ITEM_PACING_SECONDS = 10.0      # ~6 calls/min: within Groq free-tier 8k TPM
+                                # (qwen3.8-27b no-reasoning ~1.3k tokens/call)
 
 
 def _rule(char: str = "-") -> None:
@@ -137,7 +138,7 @@ def _run_scan() -> int:
             url = item.get("url", "")
 
             try:
-                verdict = evaluate_item(name, domain, snippet, url)
+                verdict = evaluate_item(name, domain, snippet, url, ticker=ticker)
             except LLMQuotaError as exc:
                 stats.quota_hit = True
                 print(f"  !! LLM quota exhausted: {exc}")
@@ -161,9 +162,11 @@ def _run_scan() -> int:
                 f"ERR:{verdict.get('error_kind', '?')}" if "error" in verdict
                 else "filler"
             )
+            delta = verdict.get("price_target_delta_pct")
+            delta_str = f" {delta:+.1f}%" if isinstance(delta, (int, float)) else ""
             print(
-                f"    ({j}/{len(raw_items)}) [{score}/10 {flag}] "
-                f"{item.get('title', '')[:70]}"
+                f"    ({j}/{len(raw_items)}) [{score}/10 {flag}]{delta_str} "
+                f"{item.get('title', '')[:64]}"
             )
 
             if verdict["valid"]:
@@ -175,6 +178,11 @@ def _run_scan() -> int:
                         headline=verdict["headline"],
                         analysis=verdict["analysis"],
                         url=url,
+                        recommendation=verdict.get("recommendation"),
+                        supply_chain_driver=verdict.get("supply_chain_driver"),
+                        price_target_delta_pct=verdict.get("price_target_delta_pct"),
+                        implied_price_target=verdict.get("implied_price_target"),
+                        financial_impact_thesis=verdict.get("financial_impact_thesis"),
                     )
                 except Exception as exc:  # a DB write must not kill the scan
                     written = False

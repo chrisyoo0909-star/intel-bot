@@ -35,6 +35,13 @@ alter table signals add column if not exists analysis         text;
 alter table signals add column if not exists url              text;
 alter table signals add column if not exists created_at       timestamptz not null default now();
 
+-- Supply-Side Equity & Capacity Analyst fields.
+alter table signals add column if not exists recommendation          text;
+alter table signals add column if not exists price_target_delta_pct  numeric;
+alter table signals add column if not exists implied_price_target    numeric;
+alter table signals add column if not exists supply_chain_driver     text;
+alter table signals add column if not exists financial_impact_thesis text;
+
 -- Collapse any pre-existing duplicates, keeping the newest row per story ...
 delete from signals s
 using signals d

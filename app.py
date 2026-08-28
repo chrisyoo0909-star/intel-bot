@@ -127,8 +127,33 @@ section[data-testid="stSidebar"] * { font-family: 'IBM Plex Mono', monospace; }
     font-size: 0.95rem;
     line-height: 1.55;
     color: #aab4c1;
+    margin-bottom: 0.7rem;
+}
+.thesis {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    color: #8b97a6;
+    border-left: 2px solid #263141;
+    padding-left: 0.7rem;
     margin-bottom: 0.9rem;
 }
+.thesis b { color: #aab4c1; letter-spacing: 0.06em; }
+.analyst-row {
+    display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.7rem;
+}
+.chip {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.7rem; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; padding: 0.22rem 0.55rem; border-radius: 4px;
+    border: 1px solid #2b3644; color: #c5cedb; background: rgba(255,255,255,0.02);
+}
+.chip-rec-buy   { color: #05070a; background: #00ff9c; border-color: #00ff9c; }
+.chip-rec-hold  { color: #ffb300; border-color: #ffb300; }
+.chip-rec-avoid { color: #ff4d6d; border-color: #ff4d6d; }
+.chip-pt-up   { color: #00ff9c; border-color: #1f6f52; }
+.chip-pt-down { color: #ff4d6d; border-color: #6f1f34; }
+.chip-driver { color: var(--accent, #00ff9c); border-color: var(--accent, #00ff9c); }
 .source-btn {
     display: inline-block;
     font-family: 'IBM Plex Mono', monospace;
@@ -211,16 +236,56 @@ def _fmt_date(value: str | None) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _rec_class(rec: str) -> str:
+    r = (rec or "").upper()
+    if "AVOID" in r:
+        return "chip-rec-avoid"
+    if "NEUTRAL" in r or "WATCH" in r or "HOLD" in r:
+        return "chip-rec-hold"
+    return "chip-rec-buy"
+
+
+def _fmt_num(value, prefix: str = "", suffix: str = "", signed: bool = False) -> str | None:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num:
+        return None
+    body = f"{num:+.1f}" if signed else f"{num:,.2f}".rstrip("0").rstrip(".")
+    return f"{prefix}{body}{suffix}"
+
+
 def render_card(sig: dict) -> None:
     domain = sig.get("domain", "—")
     accent = DOMAIN_ACCENT.get(domain, "#00ff9c")
     company = html.escape(str(sig.get("company", "—")))
     headline = html.escape(str(sig.get("headline", "")))
     analysis = html.escape(str(sig.get("analysis", "")))
+    thesis = html.escape(str(sig.get("financial_impact_thesis", "") or ""))
     score = int(sig.get("conviction_score", 0))
     date_str = _fmt_date(sig.get("created_at"))
     url = sig.get("url") or ""
 
+    rec = str(sig.get("recommendation", "") or "").strip()
+    driver = str(sig.get("supply_chain_driver", "") or "").strip()
+    delta = _fmt_num(sig.get("price_target_delta_pct"), suffix="%", signed=True)
+    target = _fmt_num(sig.get("implied_price_target"), prefix="$")
+
+    chips = []
+    if rec:
+        chips.append(f'<span class="chip {_rec_class(rec)}">{html.escape(rec)}</span>')
+    if delta:
+        cls = "chip-pt-up" if not delta.startswith("-") else "chip-pt-down"
+        pt = f'PT {delta}' + (f' → {html.escape(target)}' if target else '')
+        chips.append(f'<span class="chip {cls}">{pt}</span>')
+    if driver:
+        chips.append(f'<span class="chip chip-driver">{html.escape(driver)}</span>')
+    chips_html = f'<div class="analyst-row">{"".join(chips)}</div>' if chips else ""
+
+    thesis_html = (
+        f'<div class="thesis"><b>Financial impact:</b> {thesis}</div>' if thesis else ""
+    )
     source_html = (
         f'<a class="source-btn" href="{html.escape(url)}" target="_blank" '
         f'rel="noopener">↗ Source</a>'
@@ -238,7 +303,9 @@ def render_card(sig: dict) -> None:
             <span class="badge badge-score">[{_conviction_label(score)}]</span>
           </div>
           <div class="card-headline">{headline}</div>
+          {chips_html}
           <div class="card-analysis">{analysis}</div>
+          {thesis_html}
           {source_html}
         </div>
         """,
