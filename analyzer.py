@@ -1,67 +1,59 @@
 """
-Gemini-powered conviction grading.
+LLM-powered conviction grading.
 
-Uses the google-genai SDK (header auth via ``x-goog-api-key``) with
-GEMINI_API_KEY read strictly from the local .env. Google's current keys start
-with ``AQ.`` (the legacy ``AIza`` prefix is deprecated); both are accepted here
-and passed only as an HTTP header, never as a ``?key=`` query parameter.
+Talks to any OpenAI-compatible chat-completions endpoint. Defaults to Groq's
+free API (https://console.groq.com/keys) — no billing, no credit card required.
 
-If the SDK call fails, a raw REST fallback is attempted against the same
-endpoint using the ``x-goog-api-key`` header.
+Configure via the local .env:
+
+    LLM_API_KEY   = <key>                          # or GROQ_API_KEY
+    LLM_BASE_URL  = https://api.groq.com/openai/v1  # optional override
+    LLM_MODEL     = llama-3.3-70b-versatile         # optional override
+
+Other zero-cost backends that work by changing only those three vars:
+    OpenRouter free tier -> https://openrouter.ai/api/v1   + a ":free" model id
+    Cerebras             -> https://api.cerebras.ai/v1
+    Local Ollama         -> http://localhost:11434/v1
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 load_dotenv()
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip("'").strip('"')
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY must be set in the local .env file.")
 
-# Pinned Flash model. Google retired gemini-2.5-flash for new API keys;
-# swap to "gemini-flash-latest" if you'd rather auto-track the newest Flash.
-MODEL = "gemini-3.6-flash"
-_REST_ENDPOINT = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-)
-_REST_TIMEOUT = 45
-
-_client = genai.Client(api_key=GEMINI_API_KEY)
+def _clean(value: str | None) -> str:
+    return (value or "").strip().strip("'").strip('"').strip()
 
 
-class GeminiQuotaError(RuntimeError):
-    """Raised when Gemini reports the request quota is exhausted (HTTP 429)."""
+LLM_API_KEY = _clean(os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY"))
+if not LLM_API_KEY:
+    raise RuntimeError(
+        "Set LLM_API_KEY (or GROQ_API_KEY) in the local .env file. "
+        "Get a free key at https://console.groq.com/keys"
+    )
+
+LLM_BASE_URL = (_clean(os.environ.get("LLM_BASE_URL")) or "https://api.groq.com/openai/v1").rstrip("/")
+LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "llama-3.3-70b-versatile"
+_ENDPOINT = f"{LLM_BASE_URL}/chat/completions"
+_TIMEOUT = 45
+_MAX_RETRY_AFTER = 20  # seconds; longer waits are treated as daily exhaustion
 
 
-_RESPONSE_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    required=["conviction_score", "headline", "analysis"],
-    properties={
-        "conviction_score": types.Schema(type=types.Type.INTEGER),
-        "headline": types.Schema(type=types.Type.STRING),
-        "analysis": types.Schema(type=types.Type.STRING),
-    },
-)
+class LLMQuotaError(RuntimeError):
+    """Raised when the LLM API reports quota/rate-limit exhaustion (HTTP 429)."""
 
-# Plain-dict schema for the REST fallback body.
-_REST_SCHEMA = {
-    "type": "OBJECT",
-    "required": ["conviction_score", "headline", "analysis"],
-    "properties": {
-        "conviction_score": {"type": "INTEGER"},
-        "headline": {"type": "STRING"},
-        "analysis": {"type": "STRING"},
-    },
-}
+
+class _AuthError(RuntimeError):
+    """Internal: 401/403 from the LLM API."""
+
 
 _SYSTEM_INSTRUCTION = (
     "You are a Senior Wall Street Infrastructure Analyst. You evaluate news and "
@@ -76,9 +68,10 @@ _SYSTEM_INSTRUCTION = (
     "  9-10 = a decisive strategic shift with quantified capital or capacity impact.\n"
     "Any item that is filler, speculative, or lacks a concrete physical / capital "
     "signal MUST score below 8 and is considered invalid.\n\n"
-    "Return ONLY JSON with keys: conviction_score (int 1-10), headline (a crisp "
-    "Bloomberg/Reuters-style headline), analysis (concise two-sentence Wall Street "
-    "commentary)."
+    "Respond with ONLY a JSON object with exactly these keys: "
+    "\"conviction_score\" (integer 1-10), \"headline\" (a crisp Bloomberg/Reuters-"
+    "style headline string), \"analysis\" (a concise two-sentence Wall Street "
+    "commentary string)."
 )
 
 
@@ -95,63 +88,109 @@ def _fallback(reason: str, kind: str = "other") -> dict[str, Any]:
 
 def _looks_like_quota(text: str) -> bool:
     t = (text or "").lower()
-    return (
-        "429" in t
-        or "resource_exhausted" in t
-        or "quota" in t
-        or "rate limit" in t
-        or "rate-limit" in t
+    return any(
+        s in t
+        for s in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit")
     )
 
 
 def _looks_like_auth(text: str) -> bool:
     t = (text or "").lower()
-    return (
-        "api key not valid" in t
-        or "api_key_invalid" in t
-        or "unauthenticated" in t
-        or "permission_denied" in t
-        or "401" in t
-        or "403" in t
+    return any(
+        s in t
+        for s in (
+            "invalid api key",
+            "api key not valid",
+            "invalid_api_key",
+            "unauthenticated",
+            "unauthorized",
+            "permission_denied",
+            "401",
+            "403",
+        )
     )
 
 
-def _rest_generate(prompt: str) -> str:
-    """
-    Call Gemini over plain HTTPS with header auth. Returns the raw JSON text.
+def _mentions_daily(text: str) -> bool:
+    t = (text or "").lower()
+    return "per day" in t or "daily" in t or "rpd" in t or "tpd" in t
 
-    The API key is sent ONLY in the 'x-goog-api-key' header — never as ?key=.
-    """
-    resp = requests.post(
-        _REST_ENDPOINT,
+
+def _post(payload: dict[str, Any]) -> requests.Response:
+    return requests.post(
+        _ENDPOINT,
         headers={
-            "x-goog-api-key": GEMINI_API_KEY,
+            "Authorization": f"Bearer {LLM_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "system_instruction": {"parts": [{"text": _SYSTEM_INSTRUCTION}]},
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-                "responseSchema": _REST_SCHEMA,
-            },
-        },
-        timeout=_REST_TIMEOUT,
+        json=payload,
+        timeout=_TIMEOUT,
     )
+
+
+def _chat(prompt: str) -> str:
+    """
+    One chat completion. Returns the raw message content (expected to be JSON).
+
+    Retries once on a short per-minute 429; raises LLMQuotaError when the limit
+    is a daily cap or persists after the retry.
+    """
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_INSTRUCTION},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 500,
+        "response_format": {"type": "json_object"},
+    }
+
+    resp = _post(payload)
+
     if resp.status_code == 429:
-        raise GeminiQuotaError(f"REST 429: {resp.text[:300]}")
-    resp.raise_for_status()
+        body = resp.text[:400]
+        retry_after = 0.0
+        try:
+            retry_after = float(resp.headers.get("retry-after", "") or 0)
+        except ValueError:
+            retry_after = 0.0
+        if 0 < retry_after <= _MAX_RETRY_AFTER and not _mentions_daily(body):
+            time.sleep(retry_after + 1.0)
+            resp = _post(payload)
+            if resp.status_code == 429:
+                raise LLMQuotaError(resp.text[:300])
+        else:
+            raise LLMQuotaError(body)
+
+    if resp.status_code in (401, 403):
+        raise _AuthError(resp.text[:300])
+
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        body = resp.text or str(exc)
+        if _looks_like_quota(body):
+            raise LLMQuotaError(body[:300]) from exc
+        raise
+
     data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    return data["choices"][0]["message"]["content"]
 
 
 def _parse_verdict(raw: str) -> dict[str, Any]:
     raw = (raw or "").strip()
+    # Some models wrap JSON in ```json fences.
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[4:] if raw.lower().startswith("json") else raw
+        raw = raw.strip()
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return _fallback(f"unparseable response: {raw[:200]}", kind="parse")
+    if not isinstance(data, dict):
+        return _fallback(f"non-object response: {raw[:200]}", kind="parse")
 
     try:
         score = int(data.get("conviction_score", 0))
@@ -177,15 +216,15 @@ def evaluate_item(
     source_url: str,
 ) -> dict[str, Any]:
     """
-    Grade a single raw item with Gemini.
+    Grade a single raw item with the configured LLM.
 
     Returns a dict with 'conviction_score' (1-10), 'headline', 'analysis', and
     'valid' (True only when score >= 8). On a handled failure the same shape is
     returned with 'error' and 'error_kind' set and 'valid' False.
 
     Raises:
-        GeminiQuotaError: when the API quota/rate limit is exhausted, so the
-            caller can stop the run cleanly instead of burning the whole batch.
+        LLMQuotaError: when the API quota/rate limit is exhausted, so the caller
+            can stop the run cleanly instead of burning the whole batch.
     """
     snippet = (text_snippet or "").strip()
     if len(snippet) < 20:
@@ -199,39 +238,19 @@ def evaluate_item(
         "Evaluate this item now and return the JSON object."
     )
 
-    # 1) Primary path: google-genai SDK (header auth).
     try:
-        response = _client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=_RESPONSE_SCHEMA,
-                temperature=0.2,
-            ),
-        )
-        return _parse_verdict(response.text or "")
-    except GeminiQuotaError:
+        content = _chat(prompt)
+    except LLMQuotaError:
         raise
-    except Exception as sdk_exc:  # noqa: BLE001 - broad on purpose
-        msg = str(sdk_exc)
-        if _looks_like_quota(msg):
-            raise GeminiQuotaError(msg) from sdk_exc
+    except _AuthError as exc:
+        return _fallback(f"llm auth failed: {exc}", kind="auth")
+    except requests.HTTPError as exc:
+        body = getattr(exc.response, "text", "") or str(exc)
+        kind = "auth" if _looks_like_auth(body) else "network"
+        return _fallback(f"llm http error: {body[:200]}", kind=kind)
+    except requests.RequestException as exc:
+        return _fallback(f"llm request failed: {exc}", kind="network")
+    except (KeyError, IndexError, ValueError) as exc:
+        return _fallback(f"malformed llm response: {exc}", kind="parse")
 
-        # 2) Fallback path: raw REST with x-goog-api-key.
-        try:
-            return _parse_verdict(_rest_generate(prompt))
-        except GeminiQuotaError:
-            raise
-        except requests.HTTPError as http_exc:
-            body = getattr(http_exc.response, "text", "") or str(http_exc)
-            if _looks_like_quota(body):
-                raise GeminiQuotaError(body[:300]) from http_exc
-            kind = "auth" if _looks_like_auth(body) else "network"
-            return _fallback(f"gemini rest failed: {body[:200]}", kind=kind)
-        except Exception as rest_exc:  # noqa: BLE001
-            kind = "auth" if _looks_like_auth(f"{msg} {rest_exc}") else "network"
-            return _fallback(
-                f"gemini failed (sdk: {msg[:120]} | rest: {rest_exc})", kind=kind
-            )
+    return _parse_verdict(content)

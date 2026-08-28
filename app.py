@@ -254,7 +254,7 @@ st.sidebar.markdown("---")
 if st.sidebar.button("↻ Refresh feed", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
-st.sidebar.caption("Scanning loop active · data via SEC EDGAR + Google News + Gemini")
+st.sidebar.caption("Scanning loop active · data via SEC EDGAR + Google News + LLM grading")
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -340,7 +340,7 @@ with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded
                     format="%d", help="Items found before URL de-duplication"
                 ),
                 "Graded": st.column_config.NumberColumn(
-                    format="%d", help="New items actually sent to Gemini"
+                    format="%d", help="New items actually sent to the LLM"
                 ),
                 "Signals Saved": st.column_config.NumberColumn(format="%d"),
             },
@@ -354,5 +354,5 @@ with st.expander("🗂  Scan Audit History  ·  last 50 company scans", expanded
         st.caption(
             f"{len(table)} scans shown · {total_collected} collected · "
             f"{total_graded} graded · {total_sig} signals · "
-            f"{saved_pct:.0%} of Gemini calls saved by URL dedup"
+            f"{saved_pct:.0%} of LLM calls saved by URL dedup"
         )

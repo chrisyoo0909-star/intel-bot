@@ -5,14 +5,14 @@ Workflow:
   1. Seed the company queue if empty.
   2. Pull the oldest-scanned batch of companies.
   3. Scrape recent SEC filings + Google News for each (skipping URLs already seen).
-  4. Grade every new item through the Gemini analyzer.
+  4. Grade every new item through the LLM analyzer.
   5. Upsert items scoring >= 8 into the 'signals' table.
   6. Fingerprint graded URLs, audit-log the company, stamp last_scanned.
   7. Print progress + a final summary.
 
 Exit codes:
-  0  scan completed and Gemini was healthy
-  1  Gemini quota exhausted mid-run, or > 50% of Gemini calls failed
+  0  scan completed and the LLM was healthy
+  1  LLM quota exhausted mid-run, or > 50% of LLM calls failed
      (so a scheduled GitHub Actions run turns red instead of failing silently)
 
 Run:  python run_scan.py
@@ -24,7 +24,7 @@ import sys
 import time
 import traceback
 
-from analyzer import GeminiQuotaError, evaluate_item
+from analyzer import LLMQuotaError, evaluate_item
 from db import (
     get_next_company_batch,
     log_scan,
@@ -38,9 +38,9 @@ from db import (
 from scraper import gather_raw_items
 
 BATCH_SIZE = 10
-MAX_ITEMS_PER_COMPANY = 8          # cap Gemini calls per company (free-tier budget)
-GEMINI_FAILURE_ABORT_RATIO = 0.5  # fail the run if this share of calls error out
-ITEM_PACING_SECONDS = 1.0
+MAX_ITEMS_PER_COMPANY = 8       # cap LLM calls per company (free-tier budget)
+LLM_FAILURE_ABORT_RATIO = 0.5   # fail the run if this share of calls error out
+ITEM_PACING_SECONDS = 2.0       # keep under ~30 requests/min on free tiers
 
 
 def _rule(char: str = "-") -> None:
@@ -49,26 +49,26 @@ def _rule(char: str = "-") -> None:
 
 class ScanStats:
     def __init__(self) -> None:
-        self.gemini_calls = 0
-        self.gemini_errors = 0
+        self.llm_calls = 0
+        self.llm_errors = 0
         self.error_kinds: dict[str, int] = {}
         self.quota_hit = False
 
     def record(self, verdict: dict) -> None:
-        self.gemini_calls += 1
+        self.llm_calls += 1
         if "error" in verdict:
-            self.gemini_errors += 1
+            self.llm_errors += 1
             kind = verdict.get("error_kind", "other")
             self.error_kinds[kind] = self.error_kinds.get(kind, 0) + 1
 
     @property
     def error_ratio(self) -> float:
-        return self.gemini_errors / self.gemini_calls if self.gemini_calls else 0.0
+        return self.llm_errors / self.llm_calls if self.llm_calls else 0.0
 
     @property
     def unhealthy(self) -> bool:
         return self.quota_hit or (
-            self.gemini_calls > 0 and self.error_ratio >= GEMINI_FAILURE_ABORT_RATIO
+            self.llm_calls > 0 and self.error_ratio >= LLM_FAILURE_ABORT_RATIO
         )
 
 
@@ -125,9 +125,9 @@ def scan() -> int:
 
             try:
                 verdict = evaluate_item(name, domain, snippet, url)
-            except GeminiQuotaError as exc:
+            except LLMQuotaError as exc:
                 stats.quota_hit = True
-                print(f"  !! Gemini quota exhausted: {exc}")
+                print(f"  !! LLM quota exhausted: {exc}")
                 print("  !! Stopping this run cleanly; unprocessed companies "
                       "keep their old last_scanned and are retried next cycle.")
                 # Finalize just what completed so far.
@@ -139,7 +139,7 @@ def scan() -> int:
                                  saved_signals, aborted=True)
 
             stats.record(verdict)
-            # Only fingerprint items Gemini actually judged; a transient API
+            # Only fingerprint items the LLM actually judged; a transient API
             # error leaves the URL unseen so the next run retries it.
             if "error" not in verdict:
                 graded_items.append(item)
@@ -175,7 +175,7 @@ def scan() -> int:
 
             time.sleep(ITEM_PACING_SECONDS)
 
-        # Fingerprint every graded URL so it is never re-sent to Gemini.
+        # Fingerprint every graded URL so it is never re-sent to the LLM.
         mark_items_seen(graded_items, company_symbol=ticker)
 
         # Audit-log this company's outcome immediately after it finishes.
@@ -208,11 +208,11 @@ def _finalize(
     prune_seen_urls()
 
     _rule("=")
-    print("SCAN ABORTED (Gemini quota)" if aborted else "SCAN COMPLETE")
+    print("SCAN ABORTED (LLM quota)" if aborted else "SCAN COMPLETE")
     print(f"  Companies processed : {len(processed_ids)}")
     print(f"  Items graded        : {total_items}")
     print(f"  Signals saved (>=8) : {total_signals}")
-    print(f"  Gemini calls / errs : {stats.gemini_calls} / {stats.gemini_errors} "
+    print(f"  LLM calls / errors  : {stats.llm_calls} / {stats.llm_errors} "
           f"({stats.error_ratio:.0%})")
     if stats.error_kinds:
         breakdown = ", ".join(f"{k}={v}" for k, v in sorted(stats.error_kinds.items()))
@@ -228,13 +228,13 @@ def _finalize(
     if stats.unhealthy:
         _rule("!")
         if stats.quota_hit:
-            print("  UNHEALTHY: Gemini quota/rate limit exhausted this run.")
-        if stats.gemini_calls and stats.error_ratio >= GEMINI_FAILURE_ABORT_RATIO:
-            print(f"  UNHEALTHY: {stats.error_ratio:.0%} of Gemini calls failed "
-                  f"(threshold {GEMINI_FAILURE_ABORT_RATIO:.0%}).")
+            print("  UNHEALTHY: LLM quota/rate limit exhausted this run.")
+        if stats.llm_calls and stats.error_ratio >= LLM_FAILURE_ABORT_RATIO:
+            print(f"  UNHEALTHY: {stats.error_ratio:.0%} of LLM calls failed "
+                  f"(threshold {LLM_FAILURE_ABORT_RATIO:.0%}).")
             if stats.error_kinds.get("auth"):
-                print("  -> auth errors dominate: check GEMINI_API_KEY is a valid "
-                      "current 'AQ.'-prefixed key.")
+                print("  -> auth errors dominate: check LLM_API_KEY in .env / "
+                      "repo secrets (free Groq key: https://console.groq.com/keys).")
         _rule("!")
         return 1
 

@@ -40,7 +40,7 @@ Supabase SQL editor; the outline below is kept in sync for reference):
         on scan_logs (scanned_at desc);
 
     -- Fingerprints of every article/filing already graded, so the scraper
-    -- never sends the same URL through Gemini twice.
+    -- never sends the same URL through the LLM twice.
     create table if not exists seen_urls (
         url_hash        text primary key,
         url             text,
@@ -339,7 +339,7 @@ def log_scan(
     Record one company's scan outcome in the 'scan_logs' audit table.
 
     ``raw_collected`` is the item count found before URL de-duplication;
-    ``raw_items_count`` is what was actually sent to Gemini. The gap between
+    ``raw_items_count`` is what was actually sent to the LLM. The gap between
     them is the quota saved by the seen_urls filter.
     """
     row = {

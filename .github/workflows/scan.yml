@@ -2,7 +2,7 @@ name: Autonomous Market Scanner
 
 on:
   schedule:
-    # Every 6 hours — keeps total Gemini calls within the free-tier daily budget.
+    # Every 6 hours — keeps total LLM calls within the free-tier daily budget.
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
@@ -25,7 +25,10 @@ jobs:
 
       - name: Run Market Scan
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          # Optional: set these repo secrets only to override the Groq defaults.
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python run_scan.py

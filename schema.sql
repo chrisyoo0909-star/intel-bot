@@ -41,7 +41,7 @@ create table if not exists scan_logs (
     company_name      text,
     domain            text,
     raw_collected     int  not null default 0,  -- items found before URL dedup
-    raw_items_count   int  not null default 0,  -- items actually sent to Gemini
+    raw_items_count   int  not null default 0,  -- items actually sent to the LLM
     signals_found     int  not null default 0,
     scanned_at        timestamptz not null default now()
 );
@@ -50,7 +50,7 @@ alter table scan_logs add column if not exists raw_collected int not null defaul
 create index if not exists scan_logs_scanned_at_idx
     on scan_logs (scanned_at desc);
 
--- ── seen_urls (dedup: URLs already sent through Gemini) ────────────────────
+-- ── seen_urls (dedup: URLs already sent through the LLM) ──────────────────
 create table if not exists seen_urls (
     url_hash        text primary key,
     url             text,

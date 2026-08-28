@@ -141,7 +141,7 @@ def gather_raw_items(
     Each item: {title, summary, url, source}.
 
     When ``skip_seen`` is True, URLs already recorded in Supabase's 'seen_urls'
-    table are dropped so they are never sent through Gemini a second time. If the
+    table are dropped so they are never sent through the LLM a second time. If the
     db layer is unavailable (e.g. running the scraper standalone) the filter is
     silently skipped.
 

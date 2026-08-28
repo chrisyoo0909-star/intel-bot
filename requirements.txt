@@ -1,6 +1,5 @@
-# google-genai 2.x uses header auth (x-goog-api-key) and accepts the current
-# 'AQ.'-prefixed Gemini API keys; older releases predate that key format.
-google-genai>=2.14.0
+# LLM grading uses a plain OpenAI-compatible REST call (via requests) — no
+# vendor SDK required. Default backend is Groq's free API; see analyzer.py.
 supabase>=2.4.0
 requests>=2.31.0
 feedparser>=6.0.11
