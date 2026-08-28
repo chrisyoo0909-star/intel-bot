@@ -29,6 +29,7 @@ jobs:
           # Optional: set these repo secrets only to override the Groq defaults.
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_REASONING_EFFORT: ${{ secrets.LLM_REASONING_EFFORT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python run_scan.py

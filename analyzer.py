@@ -6,20 +6,22 @@ free API (https://console.groq.com/keys) — no billing, no credit card required
 
 Configure via the local .env:
 
-    LLM_API_KEY   = <key>                          # or GROQ_API_KEY
-    LLM_BASE_URL  = https://api.groq.com/openai/v1  # optional override
-    LLM_MODEL     = openai/gpt-oss-120b             # optional override
+    LLM_API_KEY          = <key>                          # or GROQ_API_KEY
+    LLM_BASE_URL         = https://api.groq.com/openai/v1  # optional override
+    LLM_MODEL            = openai/gpt-oss-20b              # optional override
+    LLM_REASONING_EFFORT = low                            # low|medium|high; "off" omits it
 
-Other zero-cost backends that work by changing only those three vars:
+Other zero-cost backends that work by changing only those vars:
     OpenRouter free tier -> https://openrouter.ai/api/v1   + a ":free" model id
     Cerebras             -> https://api.cerebras.ai/v1
-    Local Ollama         -> http://localhost:11434/v1
+    Local Ollama         -> http://localhost:11434/v1   (set LLM_REASONING_EFFORT=off)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -41,10 +43,20 @@ if not LLM_API_KEY:
     )
 
 LLM_BASE_URL = (_clean(os.environ.get("LLM_BASE_URL")) or "https://api.groq.com/openai/v1").rstrip("/")
-LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "openai/gpt-oss-120b"
+LLM_MODEL = _clean(os.environ.get("LLM_MODEL")) or "openai/gpt-oss-20b"
+
+# Reasoning models (gpt-oss, qwen3) otherwise emit thousands of hidden tokens
+# per call and blow small free-tier per-minute token budgets. "low" keeps
+# grading quality while cutting usage ~15x. Any non-empty value is sent as-is;
+# the special value "off" omits the field for backends that reject it.
+_re_env = _clean(os.environ.get("LLM_REASONING_EFFORT")) or "low"
+LLM_REASONING_EFFORT = "" if _re_env.lower() == "off" else _re_env
+
 _ENDPOINT = f"{LLM_BASE_URL}/chat/completions"
 _TIMEOUT = 45
-_MAX_RETRY_AFTER = 20  # seconds; longer waits are treated as daily exhaustion
+_MAX_RETRY_AFTER = 30  # seconds; longer waits are treated as daily exhaustion
+_MAX_ATTEMPTS = 3
+_SNIPPET_CHARS = 2000
 
 
 class LLMQuotaError(RuntimeError):
@@ -116,6 +128,29 @@ def _mentions_daily(text: str) -> bool:
     return "per day" in t or "daily" in t or "rpd" in t or "tpd" in t
 
 
+_RETRY_DELAY_RE = re.compile(r"try again in ([\d.]+)\s*(m|min|s|ms)?", re.I)
+
+
+def _retry_delay(resp: requests.Response, body: str) -> float:
+    """Seconds to wait before retrying a 429 — from the header or the body text."""
+    header = resp.headers.get("retry-after")
+    if header:
+        try:
+            return float(header)
+        except ValueError:
+            pass
+    m = _RETRY_DELAY_RE.search(body or "")
+    if not m:
+        return 0.0
+    value = float(m.group(1))
+    unit = (m.group(2) or "s").lower()
+    if unit in ("m", "min"):
+        return value * 60
+    if unit == "ms":
+        return value / 1000
+    return value
+
+
 def _post(payload: dict[str, Any]) -> requests.Response:
     return requests.post(
         _ENDPOINT,
@@ -132,8 +167,9 @@ def _chat(prompt: str) -> str:
     """
     One chat completion. Returns the raw message content (expected to be JSON).
 
-    Retries once on a short per-minute 429; raises LLMQuotaError when the limit
-    is a daily cap or persists after the retry.
+    Retries a short per-minute 429 up to _MAX_ATTEMPTS times, sleeping the
+    delay the API asks for. Raises LLMQuotaError only when the limit is a daily
+    cap, the wait exceeds _MAX_RETRY_AFTER, or the retries are exhausted.
     """
     payload = {
         "model": LLM_MODEL,
@@ -145,23 +181,21 @@ def _chat(prompt: str) -> str:
         "max_tokens": 500,
         "response_format": {"type": "json_object"},
     }
+    if LLM_REASONING_EFFORT:
+        payload["reasoning_effort"] = LLM_REASONING_EFFORT
 
     resp = _post(payload)
-
-    if resp.status_code == 429:
-        body = resp.text[:400]
-        retry_after = 0.0
-        try:
-            retry_after = float(resp.headers.get("retry-after", "") or 0)
-        except ValueError:
-            retry_after = 0.0
-        if 0 < retry_after <= _MAX_RETRY_AFTER and not _mentions_daily(body):
-            time.sleep(retry_after + 1.0)
-            resp = _post(payload)
-            if resp.status_code == 429:
-                raise LLMQuotaError(resp.text[:300])
-        else:
+    for attempt in range(1, _MAX_ATTEMPTS):
+        if resp.status_code != 429:
+            break
+        body = resp.text[:500]
+        delay = _retry_delay(resp, body)
+        if _mentions_daily(body) or not delay or delay > _MAX_RETRY_AFTER:
             raise LLMQuotaError(body)
+        time.sleep(delay + 1.0)
+        resp = _post(payload)
+    if resp.status_code == 429:
+        raise LLMQuotaError(resp.text[:500])
 
     if resp.status_code in (401, 403):
         raise _AuthError(resp.text[:300])
@@ -234,7 +268,7 @@ def evaluate_item(
         f"COMPANY: {company_name}\n"
         f"DOMAIN: {domain}\n"
         f"SOURCE URL: {source_url}\n"
-        f"RAW ITEM:\n\"\"\"\n{snippet[:4000]}\n\"\"\"\n\n"
+        f"RAW ITEM:\n\"\"\"\n{snippet[:_SNIPPET_CHARS]}\n\"\"\"\n\n"
         "Evaluate this item now and return the JSON object."
     )
 

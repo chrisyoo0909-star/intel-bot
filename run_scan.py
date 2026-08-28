@@ -40,7 +40,7 @@ from scraper import gather_raw_items
 BATCH_SIZE = 10
 MAX_ITEMS_PER_COMPANY = 8       # cap LLM calls per company (free-tier budget)
 LLM_FAILURE_ABORT_RATIO = 0.5   # fail the run if this share of calls error out
-ITEM_PACING_SECONDS = 2.0       # keep under ~30 requests/min on free tiers
+ITEM_PACING_SECONDS = 4.0       # ~15 calls/min: within Groq free-tier 8k TPM
 
 
 def _rule(char: str = "-") -> None:
