@@ -50,6 +50,14 @@ Supabase SQL editor; the outline below is kept in sync for reference):
     create index if not exists seen_urls_first_seen_at_idx
         on seen_urls (first_seen_at desc);
 
+    -- Single-row advisory lock so two scans never run concurrently.
+    create table if not exists scan_state (
+        id            text primary key,
+        locked_at     timestamptz,
+        locked_until  timestamptz not null default '1970-01-01T00:00:00Z',
+        host          text
+    );
+
 Credentials are read strictly from the local .env file.
 """
 
@@ -503,3 +511,63 @@ def prune_seen_urls(days: int = SEEN_URL_RETENTION_DAYS) -> int:
     except Exception as exc:
         print(f"[db] WARNING: seen_urls prune skipped: {exc}")
         return 0
+
+
+# ----------------------------------------------------------------- scan_state
+
+_LOCK_ID = "singleton"
+
+
+def acquire_scan_lock(minutes: int = 45) -> bool:
+    """
+    Best-effort advisory lock so two scans never run concurrently.
+
+    Returns True if this process now holds the lock. The lock auto-expires after
+    ``minutes`` so a crashed run cannot wedge the pipeline forever. Race-safe on
+    the update path (Postgres serializes ``update ... where locked_until < now``);
+    on any Supabase error it returns True (fail-open — a missed lock is better
+    than a skipped scan).
+    """
+    now = datetime.now(timezone.utc)
+    until = (now + timedelta(minutes=minutes)).isoformat()
+    host = os.environ.get("GITHUB_RUN_ID") or os.environ.get("COMPUTERNAME") or "local"
+    row = {"id": _LOCK_ID, "locked_at": now.isoformat(), "locked_until": until, "host": host}
+    try:
+        # Take it if the row is missing or the existing lock has expired.
+        taken = (
+            _supabase.table("scan_state")
+            .update(row)
+            .eq("id", _LOCK_ID)
+            .lt("locked_until", now.isoformat())
+            .execute()
+        )
+        if taken.data:
+            return True
+        try:
+            _supabase.table("scan_state").insert(row).execute()
+            return True  # first run ever
+        except Exception:
+            pass  # row exists and is not expired -> someone holds it
+        held = (
+            _supabase.table("scan_state")
+            .select("locked_until, host")
+            .eq("id", _LOCK_ID)
+            .execute()
+        )
+        if held.data:
+            print(f"[db] scan lock held by {held.data[0].get('host')} "
+                  f"until {held.data[0].get('locked_until')}.")
+        return False
+    except Exception as exc:
+        print(f"[db] WARNING: scan lock check failed, proceeding anyway: {exc}")
+        return True
+
+
+def release_scan_lock() -> None:
+    """Release the advisory lock (idempotent)."""
+    try:
+        _supabase.table("scan_state").update(
+            {"locked_until": EPOCH}
+        ).eq("id", _LOCK_ID).execute()
+    except Exception as exc:
+        print(f"[db] WARNING: could not release scan lock: {exc}")

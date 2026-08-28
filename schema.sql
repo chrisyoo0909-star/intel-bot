@@ -81,6 +81,18 @@ alter table seen_urls add column if not exists first_seen_at  timestamptz not nu
 create index if not exists seen_urls_first_seen_at_idx
     on seen_urls (first_seen_at desc);
 
+-- ── scan_state (single-row advisory lock: no two scans run concurrently) ──
+create table if not exists scan_state (
+    id            text primary key,
+    locked_at     timestamptz,
+    locked_until  timestamptz not null default '1970-01-01T00:00:00Z',
+    host          text
+);
+alter table scan_state add column if not exists locked_at    timestamptz;
+alter table scan_state add column if not exists locked_until timestamptz not null default '1970-01-01T00:00:00Z';
+alter table scan_state add column if not exists host         text;
+insert into scan_state (id) values ('singleton') on conflict (id) do nothing;
+
 -- Force PostgREST to refresh its schema cache so the API sees new columns
 -- immediately (otherwise a PGRST204 "column not found" can linger ~seconds).
 notify pgrst, 'reload schema';

@@ -26,11 +26,13 @@ import traceback
 
 from analyzer import LLMQuotaError, evaluate_item
 from db import (
+    acquire_scan_lock,
     get_next_company_batch,
     log_scan,
     mark_items_seen,
     prune_scan_logs,
     prune_seen_urls,
+    release_scan_lock,
     save_signal,
     seed_company_queue,
     update_scan_timestamp,
@@ -73,6 +75,17 @@ class ScanStats:
 
 
 def scan() -> int:
+    """Acquire the advisory lock, run one scan, always release the lock."""
+    if not acquire_scan_lock():
+        print("Another scan is already running (lock held). Exiting.")
+        return 0
+    try:
+        return _run_scan()
+    finally:
+        release_scan_lock()
+
+
+def _run_scan() -> int:
     print("MARKET INTELLIGENCE SCAN")
     _rule("=")
 
