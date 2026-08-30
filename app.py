@@ -324,7 +324,7 @@ if st.sidebar.button("↻ Refresh feed", use_container_width=True):
 st.sidebar.caption("Scanning loop active · data via SEC EDGAR + Google News + LLM grading")
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_signals(domain: str, score: int) -> list[dict]:
     try:
         return fetch_signals(domain=domain, min_score=score)
@@ -333,7 +333,7 @@ def load_signals(domain: str, score: int) -> list[dict]:
         return []
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_scan_logs(limit: int = 50) -> list[dict]:
     try:
         return fetch_scan_logs(limit=limit)
@@ -342,7 +342,7 @@ def load_scan_logs(limit: int = 50) -> list[dict]:
         return []
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_top_picks(limit: int = 6) -> list[dict]:
     try:
         return fetch_top_picks(limit=limit)
@@ -428,40 +428,53 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-signals = load_signals(domain_choice, min_score)
 
-domains_hit = len({s.get("domain") for s in signals})
-top_score = max((int(s.get("conviction_score", 0)) for s in signals), default=0)
-st.markdown(
-    f"""
-    <div class="metric-row">
-      <div class="metric"><div class="v">{len(signals)}</div><div class="k">Live signals</div></div>
-      <div class="metric"><div class="v">{domains_hit}</div><div class="k">Domains active</div></div>
-      <div class="metric"><div class="v">{top_score or '—'}</div><div class="k">Peak conviction</div></div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+@st.fragment(run_every=60)
+def live_dashboard(domain: str, score: int) -> None:
+    """Metrics, Executive Top Picks and the live feed — reruns itself every 60s.
 
-# ---------------------------------------------------------------- Executive Top Picks
-render_top_picks(load_top_picks(6))
+    Cached loaders use a 60s TTL, so each fragment tick pulls fresh Supabase
+    data without a full-page rerun (sidebar filters and scan audit stay put).
+    """
+    signals = load_signals(domain, score)
 
-# ---------------------------------------------------------------- Main Feed
-st.markdown("### 📡 ALL LIVE SIGNALS")
-
-if not signals:
+    domains_hit = len({s.get("domain") for s in signals})
+    top_score = max((int(s.get("conviction_score", 0)) for s in signals), default=0)
     st.markdown(
-        """
-        <div class="empty-state">
-          No high-conviction breakthroughs detected in recent scans.
-          <br><span class="pulse">Scanning loop active.</span>
+        f"""
+        <div class="metric-row">
+          <div class="metric"><div class="v">{len(signals)}</div><div class="k">Live signals</div></div>
+          <div class="metric"><div class="v">{domains_hit}</div><div class="k">Domains active</div></div>
+          <div class="metric"><div class="v">{top_score or '—'}</div><div class="k">Peak conviction</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-else:
-    for signal in signals:
-        render_card(signal)
+
+    # ------------------------------------------------------------ Executive Top Picks
+    render_top_picks(load_top_picks(6))
+
+    # ------------------------------------------------------------ Main Feed
+    updated = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    st.markdown("### 📡 ALL LIVE SIGNALS")
+    st.caption(f"Auto-refreshing every 60s · last updated {updated}")
+
+    if not signals:
+        st.markdown(
+            """
+            <div class="empty-state">
+              No high-conviction breakthroughs detected in recent scans.
+              <br><span class="pulse">Scanning loop active.</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        for signal in signals:
+            render_card(signal)
+
+
+live_dashboard(domain_choice, min_score)
 
 
 # ---------------------------------------------------------------- Scan Audit
